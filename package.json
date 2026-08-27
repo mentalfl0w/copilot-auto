@@ -1,10 +1,17 @@
 {
   "name": "copilot-auto",
-  "description": "GitHub Copilot auto-session routing for oh-my-pi (OMP): injects a single github-copilot/auto model, drives POST /models/session + /models/session/intent, and stamps Copilot-Session-Token on chat requests.",
-  "version": "1.0.0",
+  "description": "GitHub Copilot auto-session routing for oh-my-pi (OMP) and Pi: injects a single github-copilot/auto model, drives POST /models/session + /models/session/intent, and stamps Copilot-Session-Token on chat requests.",
+  "version": "1.0.1",
+  "type": "module",
+  "main": "dist/index.js",
   "files": [
     "dist"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mentalfl0w/copilot-auto.git"
+  },
+  "homepage": "https://github.com/mentalfl0w/copilot-auto",
   "keywords": [
     "omp",
     "oh-my-pi",
@@ -26,7 +33,8 @@
     "typecheck": "tsc --noEmit",
     "build": "bun build src/index.ts --outdir dist --target bun",
     "dev": "bun run src/index.ts",
-    "test": "bun test src"
+    "test": "bun test src",
+    "test:pi-load": "node scripts/test-pi-load.mjs"
   },
   "omp": {
     "extensions": [

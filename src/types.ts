@@ -13,6 +13,10 @@ export interface LoggerLike {
 
 /** The pi/omp extension API surface used by this extension. */
 export interface ExtensionAPI {
+  /** Runtime discriminator (omp-wechat convention): OMP injects a
+   *  truthy `pi` self-reference on the ExtensionAPI; Pi does not.
+   *  Truthy → OMP, falsy/absent → Pi (see runtime-compat.ts). */
+  pi?: unknown;
   on(event: string, handler: (event: unknown, ctx: ExtensionCtx) => unknown): void;
   registerCommand(name: string, def: { description: string; handler: (args: unknown, ctx: ExtensionCtx) => void | Promise<void> }): void;
   /** Structured sink into the host's own log file (best-effort). */
@@ -80,13 +84,14 @@ export interface ProviderRegistration {
   apiKey?: string;
   api?: string;
   headers?: Record<string, string>;
-  /** OAuth-provider marker. The host's runtime registerProvider validates
-   *  non-empty model lists as requiring `apiKey` or `oauth`; the marker
-   *  makes the credential-less load-phase registration valid. The host
-   *  resolves /login and token refresh from its BUILT-IN provider registry
-   *  first, so this marker never shadows the real Copilot OAuth flow
-   *  (DESIGN §9.4 — no apiKey is passed at load, so the stored OAuth keeps
-   *  resolving lazily). */
+  /** OAuth-provider marker — OMP ONLY (see runtime-compat.loadPhaseOAuth).
+   *  OMP's runtime registerProvider validates non-empty model lists as
+   *  requiring `apiKey` or `oauth`; the marker makes the credential-less
+   *  load-phase registration valid without shadowing the built-in Copilot
+   *  OAuth flow (DESIGN §9.4 — no apiKey is passed at load, so the stored
+   *  OAuth keeps resolving lazily). Pi's registerProvider would adapt a
+   *  supplied `oauth` as a COMPLETE ExtensionOAuthConfig, so Pi receives
+   *  NO marker and inherits its built-in `github-copilot` OAuth. */
   oauth?: { name?: string };
   /** Provider-level compat forwarded by the host's registerProvider into
    *  the model builder (sOe(..., t.compat, ..., model)). Model-entry
@@ -102,6 +107,14 @@ export interface ExtensionCtx {
   sessionManager?: { getSessionId?: () => string | undefined };
   modelRegistry?: {
     getApiKeyForProvider(providerId: string, sessionId?: string, opts?: unknown): Promise<string | undefined>;
+    /** Pi fallback: resolves the provider's current auth (stored OAuth /
+     *  api key) when getApiKeyForProvider is absent or fails. Never
+     *  log the returned credential. */
+    getProviderAuth?(providerId: string): Promise<{ auth?: { apiKey?: string } } | undefined>;
+    /** Pi registry snapshot: full Model list ({ provider, id, api,
+     *  baseUrl, … }). Catalog adapter fallback when ctx.models is
+     *  absent (see runtime-compat.catalogModelEntries). */
+    getAll?(): CopilotCatalogModel[];
     /** Trigger the host's background catalog refresh (idempotent).
      *  Present on the live ModelRegistry; used to ensure ctx.models.list()
      *  reflects the account's current catalog before anchoring. */
@@ -115,6 +128,10 @@ export interface ExtensionCtx {
   models?: {
     list(): CopilotCatalogModel[];
   };
+  /** Pi: session-scoped model entries ({ model: { provider, id, api,
+   *  baseUrl, … }, thinkingLevel? }) — the same set /scoped-models
+   *  shows. Catalog adapter fallback when ctx.models is absent. */
+  scopedModels?: readonly { model: CopilotCatalogModel }[];
   ui: {
     setStatus(id: string, text: string | undefined): void;
     notify?(msg: string, level: "info" | "warning"): void;

@@ -48,10 +48,21 @@ interface FakePi {
   }>;
 }
 
-function fakePi(): FakePi {
+/** OMP-shaped fake: the host injects a truthy `pi` self-reference. */
+function fakePiOmp(): FakePi {
+  return fakePiFor({ pi: {} });
+}
+
+/** Pi-shaped fake: Pi does NOT inject the self-reference (pi undefined). */
+function fakePiPi(): FakePi {
+  return fakePiFor({ pi: undefined });
+}
+
+function fakePiFor(shape: { pi?: unknown }): FakePi {
   const handlers = new Map<string, Handler>();
   const registrations: FakePi["registrations"] = [];
   const pi: ExtensionAPI = {
+    pi: shape.pi,
     on: (event, handler) => {
       handlers.set(event, handler);
     },
@@ -120,7 +131,7 @@ function harness() {
 test("probe seed is scoped to its session; same-model turns get their own tokens", async () => {
   const mock = harness();
   try {
-    const { pi, handlers } = fakePi();
+    const { pi, handlers } = fakePiOmp();
     new CopilotAuto(pi).register();
 
     // Registration on session A: the probe seeds A only.
@@ -153,7 +164,7 @@ test("probe seed is scoped to its session; same-model turns get their own tokens
 test("non-auto payloads pass through unmutated", async () => {
   const mock = harness();
   try {
-    const { pi, handlers } = fakePi();
+    const { pi, handlers } = fakePiOmp();
     new CopilotAuto(pi).register();
     await fire(handlers, "session_start", undefined, ctxFor("sess-A"));
 
@@ -173,7 +184,7 @@ test("model is registered at factory load — resolvable BEFORE session_start (s
   // fires; a registration deferred to session_start loses the startup
   // selection to `Model "github-copilot/auto" not found` (the observed
   // failure). The factory must register the shell model immediately.
-  const { pi, registrations } = fakePi();
+  const { pi, registrations } = fakePiOmp();
   new CopilotAuto(pi).register();
 
   assert.equal(registrations.length, 1, "load-phase registration must exist before any event fires");
@@ -191,10 +202,31 @@ test("model is registered at factory load — resolvable BEFORE session_start (s
   assert.equal(load.models?.[0]?.baseUrl, INDIVIDUAL);
 });
 
+test("Pi-shaped API (pi undefined) registers the auto model WITHOUT the oauth marker", () => {
+  // Pi does not inject the `pi` self-reference (omp-wechat convention).
+  // Pi's registerProvider adapts a supplied `oauth` as a COMPLETE
+  // ExtensionOAuthConfig (login/refreshToken/getApiKey functions
+  // required), so the bare OMP marker would shadow the built-in GitHub
+  // Copilot OAuth with a broken partial config. The credential-less load
+  // registration must succeed with NO marker — Pi then inherits its
+  // built-in `github-copilot` OAuth (load must never fail on missing
+  // auth; issue #1 lesson).
+  const { pi, registrations } = fakePiPi();
+  new CopilotAuto(pi).register();
+
+  assert.equal(registrations.length, 1, "load-phase registration must exist before any event fires");
+  const load = registrations[0];
+  assert.equal(load.providerId, "github-copilot");
+  assert.equal(load.oauth, undefined, "Pi must not receive a partial oauth config — it inherits the built-in Copilot OAuth");
+  assert.equal(load.apiKey, undefined, "no credential exists at load — resolution stays lazy via stored OAuth");
+  assert.equal(load.models?.length, 1, "exactly one public model");
+  assert.equal(load.models?.[0]?.id, AUTO_MODEL_ID);
+});
+
 test("registered Claude shell model carries disableStrictTools in provider compat", async () => {
   const mock = harness();
   try {
-    const { pi, handlers, registrations } = fakePi();
+    const { pi, handlers, registrations } = fakePiOmp();
     new CopilotAuto(pi).register();
     await fire(handlers, "session_start", undefined, ctxFor("sess-A"));
 
@@ -236,7 +268,7 @@ test("responses-anchored registration uses the account-specific responses endpoi
     return jsonResponse({});
   }) as unknown as typeof fetch;
   try {
-    const { pi, handlers, registrations } = fakePi();
+    const { pi, handlers, registrations } = fakePiOmp();
     new CopilotAuto(pi).register();
     await fire(handlers, "session_start", undefined, ctxFor("sess-A"));
 
@@ -258,7 +290,7 @@ test("responses-anchored registration uses the account-specific responses endpoi
 test("concurrent same-model turns never cross-stamp session tokens", async () => {
   const mock = harness();
   try {
-    const { pi, handlers } = fakePi();
+    const { pi, handlers } = fakePiOmp();
     new CopilotAuto(pi).register();
     await fire(handlers, "session_start", undefined, ctxFor("sess-A"));
 
@@ -299,7 +331,7 @@ test("session_shutdown restores the patch and clears the queue; the next session
   // middleware): traffic must flow through it, never the stale one.
   const h2Seen: string[] = [];
   try {
-    const { pi, handlers } = fakePi();
+    const { pi, handlers } = fakePiOmp();
     new CopilotAuto(pi).register();
 
     // Session 1: install over H1, register, route one turn (queues a token).
@@ -341,7 +373,7 @@ test("session_shutdown restores the patch and clears the queue; the next session
 test("compaction drops the compacted session's queued tokens, preserving siblings'", async () => {
   const mock = harness();
   try {
-    const { pi, handlers } = fakePi();
+    const { pi, handlers } = fakePiOmp();
     new CopilotAuto(pi).register();
     await fire(handlers, "session_start", undefined, ctxFor("sess-A"));
 
@@ -387,7 +419,7 @@ test("compaction drops retry leases: a pre-compaction retry never re-stamps post
     return jsonResponse({});
   }) as unknown as typeof fetch;
   try {
-    const { pi, handlers } = fakePi();
+    const { pi, handlers } = fakePiOmp();
     new CopilotAuto(pi).register();
     await fire(handlers, "session_start", undefined, ctxFor("sess-A"));
     const payload: WirePayload = { model: "auto" };
@@ -458,7 +490,7 @@ function maiHarness(): {
 test("mai pool + catalog metadata anchors openai-responses on the account-specific baseUrl and routes mai", async () => {
   const mock = maiHarness();
   try {
-    const { pi, handlers, registrations } = fakePi();
+    const { pi, handlers, registrations } = fakePiOmp();
     new CopilotAuto(pi).register();
     await fire(handlers, "session_start", undefined, ctxFor("sess-A"));
 
@@ -491,7 +523,7 @@ test("mai pool + catalog metadata anchors openai-responses on the account-specif
 test("anchor prefers the server selected_model's endpoint over the largest pool group", async () => {
   const mock = maiHarness();
   try {
-    const { pi, handlers, registrations } = fakePi();
+    const { pi, handlers, registrations } = fakePiOmp();
     new CopilotAuto(pi).register();
     await fire(handlers, "session_start", undefined, ctxFor("sess-A"));
 
@@ -548,7 +580,7 @@ function promptHarness(): {
 test("before_agent_start captures the RPC prompt: intent fetch sees it and routes to the candidate", async () => {
   const mock = promptHarness();
   try {
-    const { pi, handlers } = fakePi();
+    const { pi, handlers } = fakePiOmp();
     new CopilotAuto(pi).register();
     await fire(handlers, "session_start", undefined, ctxFor("sess-A"));
 
@@ -584,7 +616,7 @@ test("before_agent_start captures the RPC prompt: intent fetch sees it and route
 test("interactive `input` capture still feeds the intent router (RPC path must not regress it)", async () => {
   const mock = promptHarness();
   try {
-    const { pi, handlers } = fakePi();
+    const { pi, handlers } = fakePiOmp();
     new CopilotAuto(pi).register();
     await fire(handlers, "session_start", undefined, ctxFor("sess-A"));
 
@@ -611,7 +643,7 @@ test("interactive `input` capture still feeds the intent router (RPC path must n
 test("an empty before_agent_start prompt never overwrites a captured prompt", async () => {
   const mock = promptHarness();
   try {
-    const { pi, handlers } = fakePi();
+    const { pi, handlers } = fakePiOmp();
     new CopilotAuto(pi).register();
     await fire(handlers, "session_start", undefined, ctxFor("sess-A"));
 

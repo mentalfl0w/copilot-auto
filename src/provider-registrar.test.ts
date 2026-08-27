@@ -115,6 +115,67 @@ test("catalogDescriptors indexes only github-copilot entries with a supported ap
   assert.equal(catalog.get("no-base-url"), undefined);
 });
 
+test("catalogDescriptors falls back to modelRegistry.getAll() when ctx.models is absent (Pi)", () => {
+  // Pi exposes the registry snapshot as ctx.modelRegistry.getAll()
+  // (Model[] with provider/id/api/baseUrl); ctx.models does not exist.
+  const ctx: ExtensionCtx = {
+    hasUI: true,
+    ui: { setStatus: () => {} },
+    modelRegistry: {
+      getApiKeyForProvider: async () => "bearer",
+      getAll: (): CopilotCatalogModel[] => [
+        { provider: "github-copilot", id: "mai-code-1.1-flash", api: "openai-responses", baseUrl: INDIVIDUAL },
+        { provider: "github-copilot", id: "claude-sonnet-4-6", api: "anthropic-messages", baseUrl: BASE },
+        { provider: "other-provider", id: "claude-sonnet-4-6", api: "anthropic-messages", baseUrl: BASE },
+      ],
+    },
+  };
+  const catalog = catalogDescriptors(ctx);
+  assert.equal(catalog.size, 2, "getAll entries are indexed with provider/id/api/baseUrl preserved");
+  assert.deepEqual(catalog.get("mai-code-1.1-flash"), { api: "openai-responses", baseUrl: INDIVIDUAL });
+  assert.deepEqual(catalog.get("claude-sonnet-4-6"), { api: "anthropic-messages", baseUrl: BASE });
+});
+
+test("catalogDescriptors falls back to scopedModels when models and getAll are absent (Pi)", () => {
+  // Pi also exposes ctx.scopedModels ({ model, thinkingLevel? }[]).
+  const ctx: ExtensionCtx = {
+    hasUI: true,
+    ui: { setStatus: () => {} },
+    scopedModels: [
+      { model: { provider: "github-copilot", id: "gpt-5.4", api: "openai-responses", baseUrl: INDIVIDUAL } },
+      { model: { provider: "github-copilot", id: "mai-code-1.1-flash", api: "openai-responses", baseUrl: INDIVIDUAL } },
+    ],
+  };
+  const catalog = catalogDescriptors(ctx);
+  assert.equal(catalog.size, 2);
+  assert.deepEqual(catalog.get("gpt-5.4"), { api: "openai-responses", baseUrl: INDIVIDUAL });
+});
+
+test("catalogDescriptors prefers ctx.models.list() when both surfaces exist (OMP)", () => {
+  // OMP exposes BOTH ctx.models.list() and (structurally) a
+  // modelRegistry — list() is the live registry view and must win so
+  // OMP endpoint routing does not regress.
+  const ctx: ExtensionCtx = {
+    hasUI: true,
+    ui: { setStatus: () => {} },
+    modelRegistry: {
+      getApiKeyForProvider: async () => "bearer",
+      getAll: (): CopilotCatalogModel[] => [
+        { provider: "github-copilot", id: "stale-entry", api: "openai-responses", baseUrl: BASE },
+      ],
+    },
+    models: {
+      list: (): CopilotCatalogModel[] => [
+        { provider: "github-copilot", id: "mai-code-1.1-flash", api: "openai-responses", baseUrl: INDIVIDUAL },
+      ],
+    },
+  };
+  const catalog = catalogDescriptors(ctx);
+  assert.equal(catalog.size, 1, "only ctx.models.list() entries are indexed");
+  assert.deepEqual(catalog.get("mai-code-1.1-flash"), { api: "openai-responses", baseUrl: INDIVIDUAL });
+  assert.equal(catalog.get("stale-entry"), undefined);
+});
+
 test("buildAutoModel carries the anchor endpoint on the shell model", () => {
   const responses = buildAutoModel({ api: "openai-responses", baseUrl: INDIVIDUAL });
   assert.equal(responses.id, AUTO_MODEL_ID);

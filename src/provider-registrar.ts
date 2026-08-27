@@ -68,6 +68,7 @@ import type {
   ProviderModelEntry,
   ProviderRegistration,
 } from "./types.ts";
+import { catalogModelEntries, loadPhaseOAuth, resolveProviderCredential, runtimeKind } from "./runtime-compat.ts";
 
 /** Public id of the single injected model: github-copilot/auto. */
 export const AUTO_MODEL_ID = "auto";
@@ -138,7 +139,7 @@ export function buildAutoModel(descriptor: EndpointDescriptor): ProviderModelEnt
  *  URL are indexed, keyed by the catalog model id. */
 export function catalogDescriptors(ctx: ExtensionCtx): Map<string, EndpointDescriptor> {
   const out = new Map<string, EndpointDescriptor>();
-  for (const model of ctx.models?.list?.() ?? []) {
+  for (const model of catalogModelEntries(ctx)) {
     if (typeof model.id !== "string" || model.id.length === 0) continue;
     if (model.provider !== undefined && model.provider !== COPILOT_PROVIDER_ID) continue;
     if (!isCopilotApi(model.api) || typeof model.baseUrl !== "string" || model.baseUrl.length === 0) {
@@ -231,7 +232,13 @@ export class ProviderRegistrar {
     const config: ProviderRegistration = {
       baseUrl: COPILOT_BASE_URL,
       headers: copilotHeaders(),
-      oauth: { name: "GitHub Copilot" },
+      // OMP only: satisfies the host's "apiKey or oauth required when
+      // defining models" validation. Omitted on Pi, whose registerProvider
+      // would adapt a supplied `oauth` as a COMPLETE ExtensionOAuthConfig
+      // (login/refreshToken/getApiKey) and shadow the built-in Copilot
+      // OAuth with a broken partial config — Pi inherits its built-in
+      // `github-copilot` OAuth by omitting the marker (runtime-compat).
+      oauth: loadPhaseOAuth(runtimeKind(pi)),
       models: [buildAutoModel(DEFAULT_COPILOT_DESCRIPTOR)],
     };
     try {
@@ -285,12 +292,10 @@ export class ProviderRegistrar {
 
   private async doRegister(pi: ExtensionAPI, ctx: ExtensionCtx): Promise<RegistrarResult> {
     const sessionId = ctx.sessionManager?.getSessionId?.();
-    let bearer: string | undefined;
-    try {
-      bearer = await ctx.modelRegistry?.getApiKeyForProvider(COPILOT_PROVIDER_ID, sessionId);
-    } catch (error) {
-      this.logger.log(`credential resolution failed: ${String(error)}`);
-    }
+    // Runtime-agnostic credential resolution: getApiKeyForProvider on both
+    // hosts, Pi's getProviderAuth fallback when the primary is absent.
+    // Never logs the credential.
+    const bearer = await resolveProviderCredential(ctx.modelRegistry, COPILOT_PROVIDER_ID, sessionId);
     if (!bearer) {
       this.logger.log("no github-copilot credential resolvable; extension idle until credential re-enabled");
       return { registered: false, descriptor: undefined, seededSession: undefined, seededSessionId: undefined, bearer: undefined };
