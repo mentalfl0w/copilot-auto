@@ -4,7 +4,10 @@
  * Session lifecycle per DESIGN §7: lazy open, seeding from the catalog
  * probe, single-flight dedup of concurrent opens, refresh 60s before
  * expiry, stale-token tolerance on failed refresh, compaction
- * invalidation, and the allConversations() iterator.
+ * invalidation, scoped clearing, and route-generation checks.
+ *
+ * Lifecycle-safe route API: generation-based staleness detection,
+ * scoped/global clear for shutdown and credential-disable.
  */
 
 import { test } from "node:test";
@@ -191,7 +194,7 @@ test("ensureSession with no bearer serves the cached session without fetching", 
   }
 });
 
-test("compaction invalidation targets one session; commits and iterators update state", () => {
+test("compaction invalidation targets one session and preserves commit state", () => {
   const store = makeStore();
   const a = store.get("s1", "auto");
   const b = store.get("s2", "auto");
@@ -212,11 +215,195 @@ test("compaction invalidation targets one session; commits and iterators update 
   assert.equal(a.needsReEval, false);
   assert.equal(a.turn, 1);
 
-  const seen = [...store.allConversations()];
-  assert.equal(seen.length, 2);
-  assert.ok(seen.includes(a) && seen.includes(b));
+});
 
-  assert.equal(store.inPool(a, "gpt-5.4"), true);
-  assert.equal(store.inPool(a, "gemini-2.5-pro"), false);
-  assert.equal(store.inPool(b, "gpt-5.4"), false); // no session yet
+// ── lifecycle-safe route API tests ────────────────────────────────────
+
+test("getRouteGeneration returns 0 for fresh conversation", () => {
+  const store = makeStore();
+  const conv = store.get("s1", "auto");
+  assert.equal(store.getRouteGeneration(conv), 0);
+});
+
+test("getRouteGeneration returns current generation", () => {
+  const store = makeStore();
+  const conv = store.get("s1", "auto");
+  conv.generation = 3;
+  assert.equal(store.getRouteGeneration(conv), 3);
+});
+
+test("isRouteCurrent returns true when conversation and generation match", () => {
+  const store = makeStore();
+  const conv = store.get("s1", "auto");
+  conv.generation = 2;
+  assert.equal(store.isRouteCurrent("s1", "auto", conv, 2), true);
+});
+
+test("isRouteCurrent returns false when generation mismatches", () => {
+  const store = makeStore();
+  const conv = store.get("s1", "auto");
+  conv.generation = 3;
+  assert.equal(store.isRouteCurrent("s1", "auto", conv, 2), false);
+});
+
+test("isRouteCurrent returns false when conversation removed from store", () => {
+  const store = makeStore();
+  const conv = store.get("s1", "auto");
+  conv.generation = 1;
+  store.clear("s1");
+  assert.equal(store.isRouteCurrent("s1", "auto", conv, 1), false);
+});
+
+test("isRouteCurrent returns false when conversation replaced with new object", () => {
+  const store = makeStore();
+  const conv = store.get("s1", "auto");
+  conv.generation = 1;
+  // Simulate replacement: clear and re-get creates new ConvState
+  store.clear("s1");
+  const fresh = store.get("s1", "auto");
+  fresh.generation = 1;
+  assert.equal(store.isRouteCurrent("s1", "auto", conv, 1), false);
+});
+
+test("markNeedsReEval increments generation and clears in-flight session", () => {
+  const store = makeStore();
+  const conv = store.get("s1", "auto");
+  conv.sessionInflight = Promise.resolve(undefined);
+
+  store.markNeedsReEval("s1");
+
+  assert.equal(conv.needsReEval, true);
+  assert.equal(conv.sessionInflight, undefined);
+  assert.equal(conv.generation, 1);
+});
+
+test("markNeedsReEval on global scope increments all generations", () => {
+  const store = makeStore();
+  const a = store.get("s1", "auto");
+  const b = store.get("s2", "auto");
+
+  store.markNeedsReEval();
+
+  assert.equal(a.generation, 1);
+  assert.equal(b.generation, 1);
+});
+
+test("scoped clear removes all model entries for session", () => {
+  const store = makeStore();
+  const a = store.get("s1", "auto");
+  const b = store.get("s1", "other-model");
+  const c = store.get("s2", "auto");
+
+  store.clear("s1");
+
+  assert.equal(store.isRouteCurrent("s1", "auto", a, 0), false);
+  assert.equal(store.isRouteCurrent("s1", "other-model", b, 0), false);
+  assert.equal(store.isRouteCurrent("s2", "auto", c, 0), true);
+});
+
+test("global clear removes all conversations", () => {
+  const store = makeStore();
+  const a = store.get("s1", "auto");
+  const b = store.get("s2", "auto");
+  const c = store.get("s3", "other");
+
+  store.clear();
+
+  assert.equal(store.isRouteCurrent("s1", "auto", a, 0), false);
+  assert.equal(store.isRouteCurrent("s2", "auto", b, 0), false);
+  assert.equal(store.isRouteCurrent("s3", "other", c, 0), false);
+});
+
+test("scoped clear prevents late route from registering", () => {
+  const store = makeStore();
+  const conv = store.get("s1", "auto");
+  conv.generation = 0;
+
+  store.clear("s1");
+  const fresh = store.get("s1", "auto");
+  fresh.generation = 0;
+
+  // Old conv reference no longer in store
+  assert.equal(store.isRouteCurrent("s1", "auto", conv, 0), false);
+  // New conv is current
+  assert.equal(store.isRouteCurrent("s1", "auto", fresh, 0), true);
+});
+
+test("global clear prevents all late route registrations", () => {
+  const store = makeStore();
+  const conv1 = store.get("s1", "auto");
+  const conv2 = store.get("s2", "auto");
+  conv1.generation = 0;
+  conv2.generation = 0;
+
+  store.clear();
+
+  // Neither old reference is valid
+  assert.equal(store.isRouteCurrent("s1", "auto", conv1, 0), false);
+  assert.equal(store.isRouteCurrent("s2", "auto", conv2, 0), false);
+});
+
+test("clear does not affect conversations in other sessions when scoped", () => {
+  const store = makeStore();
+  const a = store.get("s1", "auto");
+  const b = store.get("s2", "auto");
+  a.generation = 1;
+  b.generation = 1;
+
+  store.clear("s1");
+
+  assert.equal(store.isRouteCurrent("s2", "auto", b, 1), true);
+});
+
+test("no stale state retained after clear: session and generation all gone", () => {
+  const store = makeStore();
+  const conv = store.get("s1", "auto");
+  conv.session = session();
+  conv.generation = 5;
+
+  store.clear("s1");
+
+  // Conversation removed from the store; the old object cannot be current.
+  assert.equal(store.isRouteCurrent("s1", "auto", conv, 5), false);
+});
+
+test("late session open cannot restore state after clear", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const restore = withFetch(async () => {
+    await gate;
+    return jsonResponse({
+      session_token: "late-token",
+      selected_model: "gpt-5.4",
+      available_models: ["gpt-5.4"],
+    });
+  });
+  try {
+    const store = makeStore();
+    const conv = store.get("s1", "auto");
+    const opening = store.ensureSession("s1", "auto", BASE, "bearer");
+    store.clear("s1");
+    release();
+    assert.equal(await opening, undefined);
+    assert.equal(conv.session, undefined);
+    assert.equal(conv.sessionInflight, undefined);
+    assert.equal(store.isRouteCurrent("s1", "auto", conv, 0), false);
+  } finally {
+    restore();
+  }
+});
+
+test("commitRouting after markNeedsReEval resets needsReEval and increments turn", () => {
+  const store = makeStore();
+  const conv = store.get("s1", "auto");
+
+  store.markNeedsReEval("s1");
+  assert.equal(conv.needsReEval, true);
+  assert.equal(conv.generation, 1);
+
+  store.commitRouting(conv, "gpt-5.4", "no_reasoning", false, 0.9);
+  assert.equal(conv.needsReEval, false);
+  assert.equal(conv.turn, 1);
+  // Generation stays at 1 after commitRouting (only markNeedsReEval increments it)
+  assert.equal(conv.generation, 1);
 });

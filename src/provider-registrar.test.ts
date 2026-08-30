@@ -16,9 +16,18 @@ import {
   buildAutoModel,
   catalogDescriptors,
   pickAnchorDescriptor,
+  ProviderRegistrar,
 } from "./provider-registrar.ts";
 import { DEFAULT_COPILOT_DESCRIPTOR } from "./capi-client.ts";
-import type { AutoSession, CopilotCatalogModel, EndpointDescriptor, ExtensionCtx } from "./types.ts";
+import type { CapiClient } from "./capi-client.ts";
+import type {
+  AutoSession,
+  CopilotCatalogModel,
+  EndpointDescriptor,
+  ExtensionAPI,
+  ExtensionCtx,
+  LoggerLike,
+} from "./types.ts";
 
 const BASE = "https://api.githubcopilot.com";
 const INDIVIDUAL = "https://api.individual.githubcopilot.com";
@@ -195,4 +204,146 @@ test("buildAutoModel carries the anchor endpoint on the shell model", () => {
   const anthropic = buildAutoModel({ api: "anthropic-messages", baseUrl: BASE });
   assert.equal(anthropic.api, "anthropic-messages");
   assert.equal(anthropic.baseUrl, `${BASE}/v1`, "anthropic anchor keeps the /v1 the SDK appends /messages to");
+});
+
+// ── Generation-based cancellation tests ──────────────────────────────
+
+/** Minimal CapiClient stub: registrar only invokes fetchAutoSession. */
+type RegistrarTestClient = Pick<CapiClient, "fetchAutoSession">;
+
+function stubClient(fetchResult?: AutoSession): RegistrarTestClient {
+  return {
+    fetchAutoSession: async () => fetchResult,
+  };
+}
+
+function stubLogger(): { logger: LoggerLike; logs: string[] } {
+  const logs: string[] = [];
+  return { logger: { log: (message: string) => { logs.push(message); } }, logs };
+}
+
+function makeRegistrar(client: RegistrarTestClient, logger: LoggerLike): ProviderRegistrar {
+  // Test seam: ProviderRegistrar uses only fetchAutoSession from CapiClient.
+  return new ProviderRegistrar(client as unknown as CapiClient, logger, 2000);
+}
+
+function testExtensionApi(onRegister: (providerId: string) => void): ExtensionAPI {
+  // Test seam: registrar only invokes ExtensionAPI.registerProvider.
+  return { registerProvider: onRegister } as unknown as ExtensionAPI;
+}
+
+/** Build a minimal ctx with a working credential and optional modelRegistry
+ *  refresh/background stubs. */
+function stubCtx(overrides: Partial<ExtensionCtx> = {}): ExtensionCtx {
+  return {
+    hasUI: true,
+    ui: { setStatus: () => {} },
+    modelRegistry: {
+      getApiKeyForProvider: async () => "bearer-token",
+      refreshInBackground: () => {},
+      awaitBackgroundRefresh: async () => {},
+    },
+    sessionManager: { getSessionId: () => "session-1" },
+    ...overrides,
+  };
+}
+
+test("reset increments generation and drops stale in-flight doRegister result", async () => {
+  // Arrange: build a doRegister that stalls on a deferred promise so we
+  // can call reset() mid-flight.
+  let resolveProbe!: (value: AutoSession | undefined) => void;
+  const probeDeferred = new Promise<AutoSession | undefined>((resolve) => { resolveProbe = resolve; });
+  const client = stubClient();
+  // Override fetchAutoSession to stall on the deferred promise.
+  client.fetchAutoSession = async () => probeDeferred;
+  const { logger, logs } = stubLogger();
+  const reg = makeRegistrar(client, logger);
+  const registrations: string[] = [];
+  const pi = testExtensionApi((providerId) => {
+    registrations.push(providerId);
+  });
+  const ctx = stubCtx();
+
+  // Act: start a registration (will stall on probeDeferred).
+  const p1 = reg.register(pi, ctx);
+  // Reset while in-flight — bumps generation.
+  reg.reset();
+  // Resolve the stalled probe so doRegister continues.
+  resolveProbe(session());
+  const result = await p1;
+
+  // Assert: the stale result was dropped.
+  assert.equal(result.registered, false, "stale in-flight result is dropped after reset");
+  assert.equal(registrations.length, 0, "registerProvider must NOT be called for a superseded generation");
+  assert.ok(logs.some((l) => l.includes("superseded")), "log indicates registration was superseded");
+});
+
+test("reset does not clobber a new generation's inflight reference", async () => {
+  // Arrange: two successive registrations.  The first stalls; reset is
+  // called; the second starts fresh.
+  let resolveProbe1!: (value: AutoSession | undefined) => void;
+  const deferred1 = new Promise<AutoSession | undefined>((resolve) => { resolveProbe1 = resolve; });
+  let resolveProbe2!: (value: AutoSession | undefined) => void;
+  const deferred2 = new Promise<AutoSession | undefined>((resolve) => { resolveProbe2 = resolve; });
+  let callCount = 0;
+  const client = stubClient();
+  client.fetchAutoSession = async () => {
+    callCount++;
+    return callCount === 1 ? deferred1 : deferred2;
+  };
+  const { logger } = stubLogger();
+  const reg = makeRegistrar(client, logger);
+  const registered: string[] = [];
+  const pi = testExtensionApi((providerId) => {
+    registered.push(providerId);
+  });
+  const ctx = stubCtx();
+
+  // Start first registration, then reset, then start second.
+  const p1 = reg.register(pi, ctx);
+  reg.reset();
+  const p2 = reg.register(pi, ctx);
+
+  // Resolve both stalled probes.
+  resolveProbe1(session());
+  resolveProbe2(session());
+  const [r1, r2] = await Promise.all([p1, p2]);
+
+  // Assert: first was dropped, second succeeded, registerProvider called once.
+  assert.equal(r1.registered, false, "first (stale) registration is dropped");
+  assert.equal(r2.registered, true, "second (current) registration succeeds");
+  assert.equal(registered.length, 1, "registerProvider called exactly once (for the current generation)");
+});
+
+test("deferred-promise regression: stale finally does not clear a newer inflight", async () => {
+  // This specifically tests that the generation guard in .finally() prevents
+  // the old registration from clobbering this.inflight when it settles.
+  let resolve1!: (value: AutoSession | undefined) => void;
+  const deferred1 = new Promise<AutoSession | undefined>((resolve) => { resolve1 = resolve; });
+  let resolve2!: (value: AutoSession | undefined) => void;
+  const deferred2 = new Promise<AutoSession | undefined>((resolve) => { resolve2 = resolve; });
+  let callCount = 0;
+  const client = stubClient();
+  client.fetchAutoSession = async () => {
+    callCount++;
+    return callCount === 1 ? deferred1 : deferred2;
+  };
+  const { logger } = stubLogger();
+  const reg = makeRegistrar(client, logger);
+  const pi = testExtensionApi(() => {});
+  const ctx = stubCtx();
+
+  // Start first registration (stalls).
+  const p1 = reg.register(pi, ctx);
+  // Reset — generation bumps; the old .finally must NOT clear inflight.
+  reg.reset();
+  // Start second registration (should create a new inflight slot).
+  const p2 = reg.register(pi, ctx);
+  // Resolve first — its .finally fires but must leave inflight intact.
+  resolve1(session());
+  await p1;
+  // Second should still be in-flight and resolvable.
+  resolve2(session());
+  const r2 = await p2;
+  assert.equal(r2.registered, true, "second registration completes despite first settling");
 });

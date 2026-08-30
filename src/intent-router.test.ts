@@ -120,8 +120,8 @@ test("decideTurn reuses the committed route (sticky) without calling the intent 
       session: session(),
       routedModelID: "gpt-5.4",
       routedLabel: "needs_reasoning",
+      routedReasoningBucket: "low",
       routedConfidence: 0.9,
-      turn: 3,
     });
     const verdict = await router(RESPONSES_ANCHOR).decideTurn({
       conv: c,
@@ -133,6 +133,7 @@ test("decideTurn reuses the committed route (sticky) without calling the intent 
     assert.equal(fetchCalls, 0);
     assert.equal(verdict.decided, "gpt-5.4");
     assert.equal(verdict.label, "needs_reasoning");
+    assert.equal(verdict.reasoningBucket, "low");
     assert.equal(verdict.confidence, 0.9);
     assert.equal(verdict.source, "sticky");
     assert.equal(verdict.omitSessionToken, false);
@@ -168,6 +169,7 @@ test("turn-0 decideTurn filters candidates to the anchor endpoint (responses vs 
     captured = { url: String(input), init: init ?? {} };
     return jsonResponse({
       predicted_label: "needs_reasoning",
+      reasoning_bucket: "medium",
       confidence: 0.87,
       candidate_models: [
         "gemini-3.1-pro-preview", // openai-completions — must be dropped
@@ -200,6 +202,7 @@ test("turn-0 decideTurn filters candidates to the anchor endpoint (responses vs 
 
     assert.equal(verdict.decided, "mai-code-1.1-flash", "first eligible candidate of the anchor endpoint");
     assert.equal(verdict.label, "needs_reasoning");
+    assert.equal(verdict.reasoningBucket, "medium");
     assert.equal(verdict.confidence, 0.87);
     assert.equal(verdict.source, "intent");
     assert.equal(verdict.omitSessionToken, false);
@@ -315,6 +318,23 @@ test("applyReasoningBoost shapes reasoning per anchor API and never lowers effor
   assert.equal(untouched.reasoning, undefined);
   assert.equal(untouched.reasoning_effort, undefined);
   assert.equal(untouched.thinking, undefined);
+});
+
+test("reasoning_bucket controls provider effort and overrides label fallback", () => {
+  const anthropic = router(ANTHROPIC_ANCHOR);
+  const lowClaude: WirePayload = { model: "claude-sonnet-4-6" };
+  anthropic.applyReasoningBoost(lowClaude, "claude-sonnet-4-6", "no_reasoning", "low");
+  assert.deepEqual(lowClaude.thinking, { type: "enabled", budget_tokens: 4_000 });
+
+  const completions = router(COMPLETIONS_ANCHOR);
+  const mediumGpt: WirePayload = { model: "gemini-3.1-pro-preview" };
+  completions.applyReasoningBoost(mediumGpt, "gemini-3.1-pro-preview", "no_reasoning", "medium");
+  assert.equal(mediumGpt.reasoning_effort, "medium");
+
+  const responses = router(RESPONSES_ANCHOR);
+  const lowResponses: WirePayload = { model: "gpt-5.4" };
+  responses.applyReasoningBoost(lowResponses, "gpt-5.4", "no_reasoning", "low");
+  assert.deepEqual(lowResponses.reasoning, { effort: "low", summary: "auto" });
 });
 
 test("anthropicBudgetTokens option overrides the boost budget", () => {

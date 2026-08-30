@@ -12,7 +12,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { FetchPatch, type TokenProvider } from "./fetch-patch.ts";
 
-type FetchMock = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 function installMock(): { restore: () => void; seen: Array<{ input: string | URL | Request; init?: RequestInit }> } {
   const seen: Array<{ input: string | URL | Request; init?: RequestInit }> = [];
@@ -67,6 +66,70 @@ test("stamps the session token only on copilot chat POSTs", async () => {
   }
 });
 
+test("stamps only exact chat paths and accepts case-insensitive POST", async () => {
+  const { restore, seen } = installMock();
+  const patch = stampingPatch(() => "tok-path");
+  const body = JSON.stringify({ model: "gpt-5.4" });
+  try {
+    patch.install();
+    await fetch("https://api.githubcopilot.com/chat/completions", { method: "post", body });
+    await fetch("https://api.githubcopilot.com/v1/messages", { method: "POST", body });
+    await fetch("https://api.githubcopilot.com/responses", { method: "POST", body });
+    await fetch("https://api.githubcopilot.com/models/session", { method: "POST", body });
+    await fetch("https://api.githubcopilot.com/models/session/intent", { method: "POST", body });
+    await fetch("https://api.githubcopilot.com/arbitrary", { method: "POST", body });
+
+    assert.equal(seen.length, 6);
+    assert.deepEqual(
+      seen.map((entry) => new Headers(entry.init?.headers).get("Copilot-Session-Token")),
+      ["tok-path", "tok-path", "tok-path", null, null, null],
+    );
+  } finally {
+    patch.restore();
+    restore();
+  }
+});
+
+test("uses a Request object's method and body when init is omitted", async () => {
+  const { restore, seen } = installMock();
+  const patch = stampingPatch((id) => (id === "gpt-5.4" ? "tok-request" : undefined));
+  const body = JSON.stringify({ model: "gpt-5.4" });
+  const request = new Request(CHAT, { method: "POST", body });
+  try {
+    patch.install();
+    await fetch(request);
+
+    assert.equal(seen.length, 1);
+    assert.equal(new Headers(seen[0].init?.headers).get("Copilot-Session-Token"), "tok-request");
+    assert.equal((seen[0].input as Request).method, "POST");
+    assert.equal(await (seen[0].input as Request).clone().text(), body);
+  } finally {
+    patch.restore();
+    restore();
+  }
+});
+test("merges Request headers before stamping the token", async () => {
+  const { restore, seen } = installMock();
+  const patch = stampingPatch(() => "tok-request");
+  const request = new Request(CHAT, {
+    method: "POST",
+    headers: { Authorization: "Bearer request", "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "gpt-5.4" }),
+  });
+  try {
+    patch.install();
+    await fetch(request);
+
+    const headers = new Headers(seen[0].init?.headers);
+    assert.equal(headers.get("Authorization"), "Bearer request");
+    assert.equal(headers.get("Content-Type"), "application/json");
+    assert.equal(headers.get("Copilot-Session-Token"), "tok-request");
+  } finally {
+    patch.restore();
+    restore();
+  }
+});
+
 test("preserves existing headers, including Headers instances", async () => {
   const { restore, seen } = installMock();
   const patch = stampingPatch(() => "tok-2");
@@ -90,7 +153,7 @@ test("preserves existing headers, including Headers instances", async () => {
 
 test("patch falls through on unparseable input and never throws", async () => {
   const { restore, seen } = installMock();
-  const patch = stampingPatch(() => "tok");
+  const patch = stampingPatch((id) => (id === "gpt-5.4" ? "tok" : undefined));
   try {
     patch.install();
     await fetch("not a url", { method: "POST", body: "x" });
@@ -358,7 +421,7 @@ test("a retry after a concurrent sibling reuses its OWN lease token, in FIFO ord
     // 200's is spent. A later byte-identical request is indistinguishable
     // from a transport retry of the failed one, so it must reuse THAT
     // lease's token — never the sibling's, never a fresh queued token.
-    const retried = await fetch(CHAT, { method: "POST", body });
+    await fetch(CHAT, { method: "POST", body });
     assert.equal(seen.length, 3);
     assert.equal(
       new Headers(seen[2].init?.headers).get("Copilot-Session-Token"),

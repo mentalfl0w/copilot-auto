@@ -9,7 +9,15 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CapiClient, DEFAULT_API_VERSION, COPILOT_USER_AGENT } from "./capi-client.ts";
+import {
+  CapiClient,
+  COPILOT_EDITOR_PLUGIN_VERSION,
+  COPILOT_EDITOR_VERSION,
+  COPILOT_INTEGRATION_ID,
+  COPILOT_OPENAI_INTENT,
+  COPILOT_USER_AGENT,
+  DEFAULT_API_VERSION,
+} from "./capi-client.ts";
 import type { LoggerLike } from "./types.ts";
 
 const silentLogger: LoggerLike = { log: () => undefined };
@@ -47,13 +55,19 @@ test("fetchAutoSession sends copilot headers and the auto_mode body", async () =
     assert.ok(captured, "fetch must have been called");
     assert.equal(captured.url, `${BASE}/models/session`);
     const headers = new Headers(captured.init.headers);
+    assert.equal(headers.get("Accept"), "application/json");
     assert.equal(headers.get("Authorization"), "Bearer bearer-1");
     assert.equal(headers.get("Content-Type"), "application/json");
     assert.equal(headers.get("X-GitHub-Api-Version"), DEFAULT_API_VERSION);
     assert.equal(headers.get("User-Agent"), COPILOT_USER_AGENT);
-    assert.match(headers.get("VScode-SessionId") ?? "", /^[0-9a-f-]{36}\d{13}$/);
-    assert.match(headers.get("VScode-MachineId") ?? "", /^[0-9a-f]{32}$/);
-    assert.match(headers.get("Editor-Device-Id") ?? "", /^[0-9a-f-]{36}$/);
+    assert.equal(headers.get("Editor-Version"), COPILOT_EDITOR_VERSION);
+    assert.equal(headers.get("Editor-Plugin-Version"), COPILOT_EDITOR_PLUGIN_VERSION);
+    assert.equal(headers.get("Copilot-Integration-Id"), COPILOT_INTEGRATION_ID);
+    assert.equal(headers.get("Openai-Intent"), COPILOT_OPENAI_INTENT);
+    assert.equal(headers.get("X-Initiator"), "user");
+    const interactionId = headers.get("X-Interaction-Id");
+    assert.match(interactionId ?? "", /^[0-9a-f-]{36}$/);
+    assert.equal(interactionId, session?.interactionId);
     assert.equal(headers.get("Copilot-Session-Token"), null);
     assert.deepEqual(JSON.parse(String(captured.init.body)), { auto_mode: { model_hints: ["auto"] } });
 
@@ -63,6 +77,29 @@ test("fetchAutoSession sends copilot headers and the auto_mode body", async () =
     assert.deepEqual(session.availableModels, ["gpt-5.4", "claude-sonnet-4-6"]);
     assert.deepEqual(session.discountedCosts, { "gpt-5.4": 0.001 });
     assert.equal(session.expiresAtMs, 1_800_000_000 * 1000);
+  } finally {
+    restore();
+  }
+});
+
+test("unwraps OMP's structured Copilot credential before CAPI requests", async () => {
+  let authorization: string | null = null;
+  const restore = withFetch(async (_input, init) => {
+    authorization = new Headers(init?.headers).get("Authorization");
+    return jsonResponse({
+      session_token: "tok",
+      selected_model: "gpt-5.4",
+      available_models: ["gpt-5.4"],
+    });
+  });
+  try {
+    const credential = JSON.stringify({
+      token: "copilot-access-token",
+      apiEndpoint: BASE,
+      expiresAt: Date.now() + 60_000,
+    });
+    await new CapiClient(silentLogger).fetchAutoSession(BASE, credential);
+    assert.equal(authorization, "Bearer copilot-access-token");
   } finally {
     restore();
   }
@@ -97,34 +134,37 @@ test("fetchAutoSession honors the apiVersion option", async () => {
     restore();
   }
 });
-test("identity headers are per-process stable across session and intent calls", async () => {
+test("Copilot Chat headers stay stable and interaction ids follow sessions", async () => {
   const seen: Array<Record<string, string>> = [];
   const restore = withFetch(async (_input, init) => {
     const h = new Headers(init?.headers);
     seen.push({
-      session: h.get("VScode-SessionId") ?? "",
-      machine: h.get("VScode-MachineId") ?? "",
-      device: h.get("Editor-Device-Id") ?? "",
+      userAgent: h.get("User-Agent") ?? "",
+      editor: h.get("Editor-Version") ?? "",
+      plugin: h.get("Editor-Plugin-Version") ?? "",
+      integration: h.get("Copilot-Integration-Id") ?? "",
+      intent: h.get("Openai-Intent") ?? "",
+      initiator: h.get("X-Initiator") ?? "",
+      interaction: h.get("X-Interaction-Id") ?? "",
     });
     return jsonResponse({ session_token: "t", selected_model: "m", available_models: ["m"] });
   });
   try {
     const client = new CapiClient(silentLogger);
-    await client.fetchAutoSession(BASE, "b");
-    await client.getRouterDecision(BASE, "b", "t", "prompt", ["m"], {}, 100);
-    await client.fetchAutoSession(BASE, "b");
+    const first = await client.fetchAutoSession(BASE, "b");
+    await client.getRouterDecision(BASE, "b", "t", "prompt", ["m"], {}, 100, first?.interactionId);
+    const second = await client.fetchAutoSession(BASE, "b");
     assert.equal(seen.length, 3);
-    assert.equal(seen[0].session, seen[1].session, "VScode-SessionId must not change across session/intent calls");
-    assert.equal(seen[0].machine, seen[1].machine, "VScode-MachineId must not change across session/intent calls");
-    assert.equal(seen[0].device, seen[1].device, "Editor-Device-Id must not change across session/intent calls");
-    assert.equal(seen[1].session, seen[2].session, "identities stay stable for the whole CapiClient lifetime");
 
-    // A second CapiClient (another process) gets fresh identities.
-    await new CapiClient(silentLogger).fetchAutoSession(BASE, "b");
-    assert.equal(seen.length, 4);
-    assert.notEqual(seen[3].session, seen[0].session);
-    assert.notEqual(seen[3].machine, seen[0].machine);
-    assert.notEqual(seen[3].device, seen[0].device);
+    for (const key of ["userAgent", "editor", "plugin", "integration", "intent", "initiator"]) {
+      assert.equal(seen[0][key], seen[1][key]);
+      assert.equal(seen[1][key], seen[2][key]);
+    }
+    assert.match(seen[0].interaction, /^[0-9a-f-]{36}$/);
+    assert.equal(seen[0].interaction, first?.interactionId);
+    assert.equal(seen[1].interaction, first?.interactionId);
+    assert.equal(seen[2].interaction, second?.interactionId);
+    assert.notEqual(seen[0].interaction, seen[2].interaction);
   } finally {
     restore();
   }
@@ -148,7 +188,7 @@ test("fetchAutoSession degrades to undefined on non-ok, missing token, or garbag
   }
 });
 
-test("getRouterDecision stamps the session token and sends the intent body", async () => {
+test("getRouterDecision stamps the session token and sends the Copilot Chat intent profile", async () => {
   let captured: { url: string; init: RequestInit } | undefined;
   const restore = withFetch(async (input, init) => {
     captured = { url: String(input), init: init ?? {} };
@@ -171,7 +211,19 @@ test("getRouterDecision stamps the session token and sends the intent body", asy
 
     assert.ok(captured);
     assert.equal(captured.url, `${BASE}/models/session/intent`);
-    assert.equal(new Headers(captured.init.headers).get("Copilot-Session-Token"), "sess-tok");
+    const headers = new Headers(captured.init.headers);
+    assert.equal(headers.get("Accept"), "application/json");
+    assert.equal(headers.get("Authorization"), "Bearer bearer-1");
+    assert.equal(headers.get("Content-Type"), "application/json");
+    assert.equal(headers.get("X-GitHub-Api-Version"), DEFAULT_API_VERSION);
+    assert.equal(headers.get("User-Agent"), COPILOT_USER_AGENT);
+    assert.equal(headers.get("Editor-Version"), "vscode/1.107.0");
+    assert.equal(headers.get("Editor-Plugin-Version"), "copilot-chat/0.35.0");
+    assert.equal(headers.get("Copilot-Integration-Id"), "vscode-chat");
+    assert.equal(headers.get("Openai-Intent"), "conversation-edits");
+    assert.equal(headers.get("X-Initiator"), "user");
+    assert.match(headers.get("X-Interaction-Id") ?? "", /^[0-9a-f-]{36}$/);
+    assert.equal(headers.get("Copilot-Session-Token"), "sess-tok");
     const body = JSON.parse(String(captured.init.body)) as Record<string, unknown>;
     assert.equal(body.prompt, "explain this diff");
     assert.deepEqual(body.available_models, ["gpt-5.4", "claude-opus-4-6"]);
@@ -222,6 +274,63 @@ test("getRouterDecision degrades to undefined on non-ok and malformed payloads",
       await client.getRouterDecision(BASE, "b", "t", "ok", ["m"], {}, 100),
       undefined,
     );
+  } finally {
+    restore();
+  }
+});
+
+test("getRouterDecision retains both session/intent response dialects", async () => {
+  let call = 0;
+  const restore = withFetch(async () => {
+    call += 1;
+    return call === 1
+      ? jsonResponse({
+          chosen_model: "gpt-5.4",
+          reasoning_bucket: "high",
+          candidate_models: ["gpt-5.4", "gpt-5.3"],
+        })
+      : jsonResponse({
+          selected_model: "claude-sonnet-4-6",
+          predicted_label: "no_reasoning",
+          candidate_models: ["claude-sonnet-4-6"],
+        });
+  });
+  try {
+    const client = new CapiClient(silentLogger);
+    const chosen = await client.getRouterDecision(BASE, "b", "t", "first", ["gpt-5.4"], {}, 100);
+    assert.equal(chosen?.chosen_model, "gpt-5.4");
+    assert.equal(chosen?.reasoning_bucket, "high");
+    assert.deepEqual(chosen?.candidate_models, ["gpt-5.4", "gpt-5.3"]);
+
+    const selected = await client.getRouterDecision(BASE, "b", "t", "second", ["claude-sonnet-4-6"], {}, 100);
+    assert.equal(selected?.selected_model, "claude-sonnet-4-6");
+    assert.equal(selected?.predicted_label, "no_reasoning");
+    assert.deepEqual(selected?.candidate_models, ["claude-sonnet-4-6"]);
+  } finally {
+    restore();
+  }
+});
+
+test("fetchAutoSession merges caller cancellation with the configured session timeout", async () => {
+  let aborts = 0;
+  const restore = withFetch(async (_input, init) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => {
+        aborts += 1;
+        reject(new Error("aborted"));
+      });
+    }),
+  );
+  try {
+    const client = new CapiClient(silentLogger, { sessionOpenTimeoutMs: 20 });
+    assert.equal(await client.fetchAutoSession(BASE, "bearer"), undefined);
+    assert.equal(aborts, 1);
+
+    const caller = new AbortController();
+    const pending = client.fetchAutoSession(BASE, "bearer", 1_000, caller.signal);
+    caller.abort();
+    assert.equal(await pending, undefined);
+    assert.equal(aborts, 2);
   } finally {
     restore();
   }

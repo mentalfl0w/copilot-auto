@@ -19,7 +19,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CopilotAuto } from "./copilot-auto.ts";
 import { AUTO_MODEL_ID } from "./provider-registrar.ts";
-import type { CopilotCatalogModel, EndpointDescriptor, ExtensionAPI, ExtensionCtx, ProviderModelEntry, WirePayload } from "./types.ts";
+import type { CopilotCatalogModel, ExtensionAPI, ExtensionCtx, ProviderModelEntry, WirePayload } from "./types.ts";
 
 const BASE = "https://api.githubcopilot.com";
 const INDIVIDUAL = "https://api.individual.githubcopilot.com";
@@ -177,6 +177,48 @@ test("non-auto payloads pass through unmutated", async () => {
     mock.restore();
   }
 });
+test("reasoning_bucket overrides a contradictory label in fallback routing", async () => {
+  const original = globalThis.fetch;
+  const interactionIds: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    interactionIds.push(new Headers(init?.headers).get("X-Interaction-Id") ?? "");
+    if (url.endsWith("/models/session")) {
+      return jsonResponse({
+        session_token: "reasoning-session",
+        selected_model: "claude-sonnet-4-6",
+        available_models: ["claude-sonnet-4-6"],
+      });
+    }
+    if (url.endsWith("/models/session/intent")) {
+      return jsonResponse({
+        predicted_label: "no_reasoning",
+        reasoning_bucket: "low",
+        candidate_models: ["claude-sonnet-4-6"],
+      });
+    }
+    return jsonResponse({});
+  }) as unknown as typeof fetch;
+  try {
+    const { pi, handlers } = fakePiOmp();
+    new CopilotAuto(pi).register();
+    const ctx = ctxFor("sess-reasoning");
+    await fire(handlers, "session_start", undefined, ctx);
+    await fire(handlers, "input", { text: "explain this change" }, ctx);
+
+    const payload: WirePayload = { model: "auto" };
+    await fire(handlers, "before_provider_request", { payload }, ctx);
+
+    assert.equal(payload.model, "claude-sonnet-4-6");
+    assert.deepEqual(payload.thinking, { type: "enabled", budget_tokens: 4_000 });
+    assert.equal(interactionIds.length, 2);
+    assert.ok(interactionIds[0]);
+    assert.equal(interactionIds[0], interactionIds[1]);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 
 test("model is registered at factory load — resolvable BEFORE session_start (startup --model regression)", () => {
   // The host resolves the initial `--model github-copilot/auto` and the
@@ -348,7 +390,17 @@ test("session_shutdown restores the patch and clears the queue; the next session
 
     // The host re-wraps fetch before the next session.
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-      h2Seen.push(new Headers(init?.headers).get("Copilot-Session-Token") ?? "");
+      const url = String(input);
+      if (url.endsWith("/models/session")) {
+        return jsonResponse({
+          session_token: "fresh-session-2",
+          selected_model: "claude-sonnet-4-6",
+          available_models: ["claude-sonnet-4-6"],
+        });
+      }
+      if (url.includes("/chat/")) {
+        h2Seen.push(new Headers(init?.headers).get("Copilot-Session-Token") ?? "");
+      }
       return new Response("{}", { status: 200 });
     }) as unknown as typeof fetch;
 
@@ -364,7 +416,7 @@ test("session_shutdown restores the patch and clears the queue; the next session
     const payload2: WirePayload = { model: "auto" };
     await fire(handlers, "before_provider_request", { payload: payload2 }, ctxFor("sess-A"));
     await fetch(CHAT_URL, { method: "POST", body: JSON.stringify({ model: "claude-sonnet-4-6" }) });
-    assert.deepEqual(h2Seen, ["", "probe-tok"]);
+    assert.deepEqual(h2Seen, ["", "fresh-session-2"]);
     assert.equal(mock1.chatTokens().length, 1, "session-2 traffic never reached the stale H1");
   } finally {
     mock1.restore();
@@ -670,5 +722,56 @@ test("an empty before_agent_start prompt never overwrites a captured prompt", as
     assert.equal(mock.intentBodies()[0].reference_count, undefined, "prior value preserved when images absent");
   } finally {
     mock.restore();
+  }
+});
+test("plain auto routes through session/intent and never calls /auto", async () => {
+  const autoCalls: string[] = [];
+  const sessionCalls: string[] = [];
+  const intentCalls: string[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/auto")) {
+      autoCalls.push(JSON.stringify(init?.body));
+      return jsonResponse({ error: "not found" }, 404);
+    }
+    if (url.endsWith("/models/session")) {
+      sessionCalls.push(JSON.stringify(init?.body));
+      return jsonResponse({
+        session_token: "session-token",
+        selected_model: "gpt-5.4",
+        available_models: ["gpt-5.4", "gpt-5.3"],
+      });
+    }
+    if (url.endsWith("/models/session/intent")) {
+      intentCalls.push(JSON.stringify(init?.body));
+      return jsonResponse({
+        predicted_label: "needs_reasoning",
+        confidence: 0.8,
+        candidate_models: ["gpt-5.4", "gpt-5.3"],
+      });
+    }
+    return jsonResponse({});
+  }) as unknown as typeof fetch;
+  try {
+    const { pi, handlers } = fakePiOmp();
+    new CopilotAuto(pi).register();
+    await fire(handlers, "session_start", undefined, ctxFor("sess-plain"));
+    // Capture the prompt — intent routing requires it.
+    await fire(
+      handlers,
+      "before_agent_start",
+      { type: "before_agent_start", prompt: "route this", images: [] },
+      ctxFor("sess-plain"),
+    );
+    const payload: WirePayload = { model: "auto" };
+    await fire(handlers, "before_provider_request", { payload }, ctxFor("sess-plain"));
+
+    assert.equal(autoCalls.length, 0, "plain auto must never call /auto");
+    assert.equal(sessionCalls.length >= 1, true, "plain auto must call /models/session");
+    assert.equal(intentCalls.length >= 1, true, "plain auto must call /models/session/intent");
+    assert.equal(payload.model, "gpt-5.4", "payload model should be routed to gpt-5.4");
+  } finally {
+    globalThis.fetch = original;
   }
 });
