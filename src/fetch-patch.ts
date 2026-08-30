@@ -8,14 +8,8 @@
  * in-process convention.
  *
  *   - Intercepts only POSTs to the Copilot chat hosts
- *     (api.githubcopilot.com / api.individual.githubcopilot.com) on any
- *     supported chat path (/chat/completions, /v1/messages, /responses).
- *   - The token is supplied by a TokenProvider that CONSUMES a pending
- *     token queued per wire model id by the routing hook immediately
- *     before each request is dispatched — never selected from a scan of
- *     conversation state, so concurrent sessions routing the same model
- *     each get their own token (FIFO per model).
- *   - Intercepts only POSTs to api.githubcopilot.com chat endpoints.
+ *     (api.githubcopilot.com / api.individual.githubcopilot.com) on the
+ *     exact supported chat paths (/chat/completions, /v1/messages, /responses).
  *   - The token is supplied by a TokenProvider that CONSUMES a pending
  *     token queued per wire model id by the routing hook immediately
  *     before each request is dispatched — never selected from a scan of
@@ -26,12 +20,11 @@
  *     another session: tokens are leased per request fingerprint, one
  *     lease per stamped exchange. A lease is reused only after its
  *     exchange threw or returned 429/5xx (a transport retry); while
- *     in-flight it is NOT reused, so two genuinely concurrent
- *     byte-identical requests (two sessions, same prompt) each consume
- *     their own queued token and stamp A and B, never A twice. A request
- *     whose exchange already completed never takes a fresh token — it
- *     fails closed (no stamp) rather than cross-stamping a different
- *     conversation.
+ *     in-flight it is NOT reused, so two genuinely concurrent byte-identical
+ *     requests (two sessions, same prompt) each consume their own queued token
+ *     and stamp A and B, never A twice. A request whose exchange already
+ *     completed never takes a fresh token — it fails closed (no stamp) rather
+ *     than cross-stamping a different conversation.
  *   - NEVER logs tokens; failures fall through to the original fetch.
  */
 
@@ -47,6 +40,13 @@ export interface TokenProvider {
    */
   takeTokenForWireModel(wireModelId: string | undefined): string | undefined;
 }
+
+interface ResolvedRequest {
+  url: URL | undefined;
+  method: string;
+  body: string | undefined;
+}
+
 
 export class FetchPatch {
   private installed = false;
@@ -87,21 +87,22 @@ export class FetchPatch {
       let leaseEntry: RequestLease | undefined;
       let token: string | undefined;
       try {
-        const url = FetchPatch.requestUrl(input);
+        const request = await FetchPatch.resolveRequest(input, init);
+        const { url, method, body } = request;
         if (
           url !== undefined &&
           FetchPatch.isCopilotChatHost(url.hostname) &&
-          (init?.method ?? "GET") === "POST" &&
-          !url.pathname.startsWith("/models/session")
+          method.toUpperCase() === "POST" &&
+          FetchPatch.isCopilotChatPath(url.pathname)
         ) {
-          const wireModel = FetchPatch.wireModelFromBody(init?.body);
+          const wireModel = FetchPatch.wireModelFromBody(body);
           // SHA-256 over method+URL+body — async, so concurrent identical
           // requests resume after it one at a time. The lease decision
           // below is fully synchronous (no awaits between the digest and
           // the hold), so the first request to resume claims its lease
           // before the second resumes: the digest can never let two
           // requests both see an empty table for the same fingerprint.
-          fingerprint = await FetchPatch.fingerprint(input, init);
+          fingerprint = await FetchPatch.fingerprint(request);
           if (fingerprint !== undefined) {
             // Reuse ONLY a non-active lease — a prior attempt of THIS
             // request that threw or returned 429/5xx — so a transport
@@ -123,9 +124,12 @@ export class FetchPatch {
             token = provider.takeTokenForWireModel(wireModel);
           }
           if (token !== undefined) {
-            // Headers may arrive as a plain object or a Headers instance;
-            // merge through Headers so neither path loses existing headers.
-            const headers = new Headers(init?.headers);
+            // A Request input already carries auth/content headers. Merge the
+            // explicit init headers over it before adding the route token;
+            // supplying `{ headers }` must not silently discard Request
+            // headers needed by the host transport.
+            const headers = new Headers(input instanceof Request ? input.headers : undefined);
+            new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
             headers.set("Copilot-Session-Token", token);
             init = { ...init, headers };
             log(`fetch patch: stamped Copilot-Session-Token for ${wireModel ?? "?"}`);
@@ -183,6 +187,32 @@ export class FetchPatch {
   }
 
 
+  private static async resolveRequest(
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<ResolvedRequest> {
+    const request = input instanceof Request ? input : undefined;
+    const url = FetchPatch.requestUrl(input);
+    const method =
+      typeof init?.method === "string"
+        ? init.method
+        : request?.method ?? "GET";
+
+    let body: string | undefined;
+    if (typeof init?.body === "string") {
+      body = init.body;
+    } else if (init?.body === undefined && request !== undefined && request.body !== null) {
+      try {
+        // Read a clone so the original Request remains untouched for fetch.
+        body = await request.clone().text();
+      } catch {
+        // A used or otherwise unreadable body is fail-open.
+        body = undefined;
+      }
+    }
+    return { url, method, body };
+  }
+
   private static requestUrl(input: string | URL | Request): URL | undefined {
     try {
       if (typeof input === "string") return new URL(input);
@@ -201,6 +231,11 @@ export class FetchPatch {
    *  look-alike hostname can not be stamped. */
   private static isCopilotChatHost(hostname: string): boolean {
     return hostname === "api.githubcopilot.com" || hostname === "api.individual.githubcopilot.com";
+  }
+
+  /** Only the three provider chat routes can receive a session token. */
+  private static isCopilotChatPath(pathname: string): boolean {
+    return pathname === "/chat/completions" || pathname === "/v1/messages" || pathname === "/responses";
   }
 
   /** Chat POST bodies are string JSON with a top-level `model` field. */
@@ -223,20 +258,11 @@ export class FetchPatch {
    * any other request (different body) misses and takes a fresh queued
    * token. Undefined when the input carries no usable URL.
    */
-  private static async fingerprint(
-    input: string | URL | Request,
-    init?: RequestInit,
-  ): Promise<string | undefined> {
-    let url: string | undefined;
-    if (typeof input === "string") url = input;
-    else if (input instanceof URL) url = input.href;
-    else {
-      const maybe = input as Partial<Request>;
-      url = typeof maybe.url === "string" ? maybe.url : undefined;
-    }
+  private static async fingerprint(request: ResolvedRequest): Promise<string | undefined> {
+    const url = request.url?.href;
     if (url === undefined) return undefined;
-    const body = typeof init?.body === "string" ? init.body : "";
-    const method = init?.method ?? "GET";
+    const body = request.body ?? "";
+    const method = request.method.toUpperCase();
     const data = new TextEncoder().encode(`${method} ${url}\n${body}`);
     const digest = await crypto.subtle.digest("SHA-256", data);
     return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");

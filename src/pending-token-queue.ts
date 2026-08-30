@@ -59,10 +59,4 @@ export class PendingTokenQueue {
     }
   }
 
-  /** Total queued tokens across all wire models (tests, status). */
-  size(): number {
-    let total = 0;
-    for (const queue of this.queues.values()) total += queue.length;
-    return total;
-  }
 }

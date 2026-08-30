@@ -33,7 +33,7 @@
  */
 
 /** Bounded lifecycle of one stamped request under a fingerprint. */
-export type LeaseState = "in-flight" | "retryable";
+type LeaseState = "in-flight" | "retryable";
 
 /** One stamped request under a fingerprint. */
 export interface RequestLease {
@@ -110,10 +110,6 @@ export class RequestLeaseTable {
     this.total = 0;
   }
 
-  /** Total leases across all fingerprints (tests, status). */
-  size(): number {
-    return this.total;
-  }
 
   private evictOldest(): void {
     const oldest = this.leases.keys().next().value;
