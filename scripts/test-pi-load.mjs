@@ -35,12 +35,12 @@ const repoRoot = join(__dirname, "..");
 // ── Isolate BOTH the module-load dir and HOME ──
 const simDir = mkdtempSync(join(tmpdir(), "copilot-auto-pi-sim-"));
 mkdirSync(join(simDir, "ext"), { recursive: true });
-// Copy the artifact OUT of the repo so no node_modules is reachable by
-// walking up — @oh-my-pi/* and friends must genuinely fail to resolve.
+// Copy the core and host-specific artifacts OUT of the repo so the core
+// bundle still proves it has no mandatory host imports.
 cpSync(join(repoRoot, "dist", "index.js"), join(simDir, "ext", "index.js"));
+cpSync(join(repoRoot, "dist", "pi.js"), join(simDir, "ext", "pi.js"));
 // Plain Node treats .js as CJS without a package.json; Pi's jiti loader
-// auto-detects ESM, so this marker only mirrors the package's real
-// "type": "module" field in the isolated copy.
+// auto-detects ESM, so this marker mirrors the package's real "type": "module".
 writeFileSync(join(simDir, "ext", "package.json"), JSON.stringify({ type: "module" }));
 // NO credentials.json anywhere → the factory must still return
 // successfully and register the model (issue #1 lesson: load-time
@@ -93,6 +93,26 @@ if (load.models?.length !== 1 || load.models[0].id !== "auto") {
   throw new Error(`FAIL: expected the single 'auto' model, got ${JSON.stringify(load.models)}`);
 }
 console.log("PASS: load-phase registration is credential-less and marker-free (github-copilot/auto)");
+
+// ── Host-specific Pi entry ──
+// Pi supplies this package through its host runtime. The isolated simulation
+// provides only the lazyStream bridge needed by the Pi entry.
+const piAiDir = join(simDir, "ext", "node_modules", "@earendil-works", "pi-ai");
+mkdirSync(piAiDir, { recursive: true });
+writeFileSync(join(piAiDir, "package.json"), JSON.stringify({ type: "module" }));
+writeFileSync(
+  join(piAiDir, "index.js"),
+  "export const lazyStream = (_model, setup) => setup();",
+);
+const piEntry = await import(pathToFileURL(join(simDir, "ext", "pi.js")).href);
+if (typeof piEntry.default !== "function") {
+  throw new Error(`FAIL: dist/pi.js did not expose a factory (${typeof piEntry.default})`);
+}
+await piEntry.default(api);
+if (typeof api.lazyStream !== "function") {
+  throw new Error("FAIL: Pi entry did not install the host lazyStream bridge");
+}
+console.log("PASS: host-specific Pi entry loaded and installed its bridge");
 
 // ── B. File logger works under plain Node with an isolated HOME ──
 const logPath = join(simDir, "home", ".omp", "agent", "copilot-auto.log");
