@@ -18,11 +18,21 @@
 
 import { capiBase, descriptorForId, endpointKey } from "./capi-client.ts";
 import type { CapiClient, IntentContext } from "./capi-client.ts";
-import type { AutoSession, ConvState, EndpointDescriptor, LoggerLike, RouteLabel, WirePayload } from "./types.ts";
+import type {
+  AutoSession,
+  ConvState,
+  EndpointDescriptor,
+  LoggerLike,
+  ReasoningBucket,
+  RouteLabel,
+  RouterDecision,
+  WirePayload,
+} from "./types.ts";
 
-export interface RoutingVerdict {
+interface RoutingVerdict {
   decided: string;
   label: RouteLabel;
+  reasoningBucket?: ReasoningBucket;
   /** Intent-router confidence, when the verdict came from the intent endpoint. */
   confidence?: number;
   /** True when `decided` is NOT in the session pool → send without token. */
@@ -38,6 +48,15 @@ export interface IntentRouterOptions {
 
 const DEFAULT_INTENT_TIMEOUT_MS = 1_000;
 const DEFAULT_ANTHROPIC_BUDGET_TOKENS = 16_000;
+
+/** Prefer the canonical bucket and derive high effort for the older label-only dialect. */
+export function reasoningBucketFor(
+  decision: RouterDecision | undefined,
+): ReasoningBucket | undefined {
+  const bucket = decision?.reasoning_bucket;
+  if (bucket === "low" || bucket === "medium" || bucket === "high") return bucket;
+  return decision?.predicted_label === "needs_reasoning" ? "high" : undefined;
+}
 
 /**
  * Last-resort wire ids when no session exists and the pool default /
@@ -126,11 +145,11 @@ export class IntentRouter {
     const root = capiBase(baseURL);
     const session = conv.session;
 
-    // Sticky path: reuse the cached pick unless compaction invalidated it.
     if (conv.routedModelID !== undefined && !conv.needsReEval) {
       return {
         decided: conv.routedModelID,
         label: conv.routedLabel,
+        reasoningBucket: conv.routedReasoningBucket,
         confidence: conv.routedConfidence,
         omitSessionToken: !this.inPoolOrDefault(session, conv.routedModelID),
         source: "sticky",
@@ -141,6 +160,7 @@ export class IntentRouter {
     const fallback = this.endpointDefault(session);
     let decided = fallback;
     let label: RouteLabel = undefined;
+    let reasoningBucket: ReasoningBucket | undefined;
     let confidence: number | undefined;
     let source: RoutingVerdict["source"] = "fallback";
 
@@ -153,16 +173,24 @@ export class IntentRouter {
         prompt_char_count: prompt.length,
       };
       const decision = await this.client.getRouterDecision(
-        root, bearer, session.sessionToken, prompt, session.availableModels, context, this.intentTimeoutMs,
+        root,
+        bearer,
+        session.sessionToken,
+        prompt,
+        session.availableModels,
+        context,
+        this.intentTimeoutMs,
+        session.interactionId,
       );
+      reasoningBucket = reasoningBucketFor(decision);
+      label = reasoningBucket ? "needs_reasoning" : decision?.predicted_label;
       const candidates = (decision?.candidate_models ?? []).filter((id) => this.matchesEndpoint(id));
       if (candidates.length > 0) {
         decided = candidates[0];
-        label = decision?.predicted_label;
         confidence = decision?.confidence;
         source = "intent";
         this.logger.log(
-          `intent routed -> ${decided} (top=${candidates[0]}, label=${label}, confidence=${decision?.confidence})`,
+          `intent routed -> ${decided} (top=${candidates[0]}, label=${label}, bucket=${reasoningBucket ?? "none"}, confidence=${decision?.confidence})`,
         );
       } else {
         this.logger.log(`intent gave no same-endpoint candidates; keeping ${decided}`);
@@ -173,24 +201,39 @@ export class IntentRouter {
 
     // Pool-missing degradation (DESIGN §2.3): a decided model outside the
     // pool goes out without a session token.
-    return { decided, label, confidence, omitSessionToken: !this.inPoolOrDefault(session, decided), source };
+    return {
+      decided,
+      label,
+      reasoningBucket,
+      confidence,
+      omitSessionToken: !this.inPoolOrDefault(session, decided),
+      source,
+    };
   }
 
   /**
-   * Boost-only reasoning shaping for needs_reasoning turns. Never lowers
-   * effort on fast turns. Writes directly into the wire payload, keyed to
-   * the anchor endpoint's API family (the shell model's fixed transport):
-   * anthropic-messages → thinking budget, openai-completions →
-   * reasoning_effort, openai-responses → reasoning { effort, summary }.
+   * Shape provider-specific reasoning from the upstream session/intent
+   * bucket. A label-only response keeps the previous high-effort fallback.
    */
-  applyReasoningBoost(payload: WirePayload, apiId: string, label: RouteLabel): void {
-    if (label !== "needs_reasoning") return;
+  applyReasoningBoost(
+    payload: WirePayload,
+    apiId: string,
+    label: RouteLabel,
+    reasoningBucket?: ReasoningBucket,
+  ): void {
+    const bucket = reasoningBucket ?? (label === "needs_reasoning" ? "high" : undefined);
+    if (!bucket) return;
     switch (this.descriptor.api) {
-      case "anthropic-messages":
-        payload.thinking = { type: "enabled", budget_tokens: this.anthropicBudgetTokens };
+      case "anthropic-messages": {
+        const scale = bucket === "low" ? 0.25 : bucket === "medium" ? 0.5 : 1;
+        payload.thinking = {
+          type: "enabled",
+          budget_tokens: Math.max(1, Math.round(this.anthropicBudgetTokens * scale)),
+        };
         break;
+      }
       case "openai-completions":
-        payload.reasoning_effort = "high";
+        payload.reasoning_effort = bucket;
         break;
       case "openai-responses": {
         // Preserve any existing reasoning fields (include, enabled, …);
@@ -198,14 +241,14 @@ export class IntentRouter {
         const existing = payload.reasoning;
         payload.reasoning = {
           ...(isRecord(existing) ? existing : {}),
-          effort: "high",
+          effort: bucket,
           summary: "auto",
         };
         delete payload.reasoning_effort;
         break;
       }
     }
-    this.logger.log(`reasoning boost applied -> ${apiId} (${this.descriptor.api})`);
+    this.logger.log(`reasoning boost applied -> ${apiId} (${this.descriptor.api}, bucket=${bucket})`);
   }
 
   private inPoolOrDefault(session: AutoSession | undefined, apiId: string): boolean {

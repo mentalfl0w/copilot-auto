@@ -46,22 +46,23 @@
  *     ignores any top-level model-entry flag.
  */
 
-import type { CapiClient } from "./capi-client.ts";
-	import {
-	  capiBase,
-	  COPILOT_BASE_URL,
-	  COPILOT_USER_AGENT,
-	  DEFAULT_API_VERSION,
-	  DEFAULT_COPILOT_DESCRIPTOR,
-	  descriptorForId,
-	  endpointKey,
-	  isCopilotApi,
-	} from "./capi-client.ts";
+import {
+  OMP_AUTO_API,
+} from "./omp-native-provider.ts";
+import {
+  capiBase,
+  COPILOT_BASE_URL,
+  COPILOT_HEADERS,
+  DEFAULT_COPILOT_DESCRIPTOR,
+  descriptorForId,
+  endpointKey,
+  isCopilotApi,
+  type CapiClient,
+} from "./capi-client.ts";
 import { IntentRouter, type IntentRouterOptions } from "./intent-router.ts";
 import type { LoggerLike } from "./types.ts";
 import type {
   AutoSession,
-  CopilotCatalogModel,
   EndpointDescriptor,
   ExtensionAPI,
   ExtensionCtx,
@@ -75,9 +76,9 @@ export const AUTO_MODEL_ID = "auto";
 /** Provider id stays the builtin id so stored-OAuth lookups keep working. */
 export const COPILOT_PROVIDER_ID = "github-copilot";
 
-/** Copilot wire headers mirrored from the OMP catalog. */
+/** Copilot Chat request headers used by native model transports. */
 export function copilotHeaders(): Record<string, string> {
-  return { "User-Agent": COPILOT_USER_AGENT, "X-GitHub-Api-Version": DEFAULT_API_VERSION };
+  return { ...COPILOT_HEADERS };
 }
 
 /**
@@ -190,7 +191,7 @@ export function pickAnchorDescriptor(
   return largest?.descriptor ?? DEFAULT_COPILOT_DESCRIPTOR;
 }
 
-export interface RegistrarResult {
+interface RegistrarResult {
   registered: boolean;
   descriptor: EndpointDescriptor | undefined;
   seededSession: AutoSession | undefined;
@@ -200,12 +201,20 @@ export interface RegistrarResult {
   bearer: string | undefined;
 }
 
+type LoadPhaseProviderOverrides = Partial<
+  Pick<ProviderRegistration, "api" | "models" | "streamSimple" | "fetchDynamicModels">
+>;
+
 export class ProviderRegistrar {
   private done = false;
   private inflight?: Promise<RegistrarResult>;
   private lastDescriptor: EndpointDescriptor | undefined;
   private lastBearer: string | undefined;
   private lastSeededSessionId: string | undefined;
+  /** Monotonically increasing generation counter.  Each reset() bumps
+   *  it so stale in-flight doRegister() work detects it was superseded
+   *  and drops its side effects (registerProvider, done, catalog). */
+  private _gen = 0;
   /** Endpoint metadata map captured at registration — feeds the router's
    *  candidate filtering (unknown ids are never token-stamped). */
   private catalog = new Map<string, EndpointDescriptor>();
@@ -228,18 +237,18 @@ export class ProviderRegistrar {
    * OAuth descriptor. register() re-anchors this entry on session_start
    * (wholesale replacement — no stale entries).
    */
-  registerDefault(pi: ExtensionAPI): void {
+  registerDefault(pi: ExtensionAPI, overrides: LoadPhaseProviderOverrides = {}): void {
     const config: ProviderRegistration = {
       baseUrl: COPILOT_BASE_URL,
       headers: copilotHeaders(),
       // OMP only: satisfies the host's "apiKey or oauth required when
       // defining models" validation. Omitted on Pi, whose registerProvider
       // would adapt a supplied `oauth` as a COMPLETE ExtensionOAuthConfig
-      // (login/refreshToken/getApiKey) and shadow the built-in Copilot
-      // OAuth with a broken partial config — Pi inherits its built-in
-      // `github-copilot` OAuth by omitting the marker (runtime-compat).
+      // (login/refreshToken/getApiKey) and shadow the built-in GitHub
+      // Copilot OAuth with a broken partial config.
       oauth: loadPhaseOAuth(runtimeKind(pi)),
       models: [buildAutoModel(DEFAULT_COPILOT_DESCRIPTOR)],
+      ...overrides,
     };
     try {
       pi.registerProvider(COPILOT_PROVIDER_ID, config);
@@ -262,7 +271,38 @@ export class ProviderRegistrar {
     this.lastDescriptor = undefined;
     this.lastBearer = undefined;
     this.lastSeededSessionId = undefined;
+    this._gen++;
+    this.inflight = undefined;
     this.catalog = new Map();
+  }
+
+  /**
+   * Discover the current Auto pool during OMP model resolution. OMP invokes
+   * this callback before resolving a startup `--model`; no host catalog is
+   * available at that phase, so only ids with a conservative endpoint
+   * heuristic become selectable aliases.
+   */
+  async fetchLoadPhaseAliases(apiKey?: string): Promise<ProviderModelEntry[]> {
+    if (!apiKey) return [];
+    const session = await this.client.fetchAutoSession(COPILOT_BASE_URL, apiKey, this.probeTimeoutMs);
+    if (!session) return [];
+
+    const aliases: ProviderModelEntry[] = [];
+    const emptyCatalog = new Map<string, EndpointDescriptor>();
+    for (const realModelId of session.availableModels) {
+      if (!realModelId || realModelId.startsWith("auto-")) continue;
+      const descriptor = descriptorForId(realModelId, emptyCatalog);
+      if (!descriptor) continue;
+      const model = buildAutoModel(descriptor);
+      aliases.push({
+        ...model,
+        id: `auto-${realModelId}`,
+        name: `${realModelId} (auto)`,
+        api: OMP_AUTO_API,
+        baseUrl: COPILOT_BASE_URL,
+      });
+    }
+    return aliases;
   }
 
   /**
@@ -283,14 +323,22 @@ export class ProviderRegistrar {
       };
     }
     if (!this.inflight) {
+      const gen = this._gen;
       this.inflight = this.doRegister(pi, ctx).finally(() => {
-        this.inflight = undefined;
+        // Only clear the inflight slot if no reset() has bumped the
+        // generation since this registration started.  A stale
+        // generation means this work was superseded — do not clobber
+        // a newer inflight promise or leave the slot occupied.
+        if (gen === this._gen) {
+          this.inflight = undefined;
+        }
       });
     }
     return await this.inflight;
   }
 
   private async doRegister(pi: ExtensionAPI, ctx: ExtensionCtx): Promise<RegistrarResult> {
+    const gen = this._gen;
     const sessionId = ctx.sessionManager?.getSessionId?.();
     // Runtime-agnostic credential resolution: getApiKeyForProvider on both
     // hosts, Pi's getProviderAuth fallback when the primary is absent.
@@ -324,6 +372,15 @@ export class ProviderRegistrar {
       `anchor endpoint=${descriptor.api}@${capiBase(descriptor.baseUrl)} (pool=[${poolMapped}], catalog=${catalog.size}, probe=${seededSession ? "ok" : "failed"})`,
     );
 
+    // A reset() during the async credential/probe work bumps _gen — the
+    // registration was superseded.  Drop all side effects so the old
+    // in-flight work never registers a provider, restores stale
+    // done/catalog state, or clobbers a newer generation's slot.
+    if (gen !== this._gen) {
+      this.logger.log("registration superseded by reset; dropping stale result");
+      return { registered: false, descriptor: undefined, seededSession: undefined, seededSessionId: undefined, bearer: undefined };
+    }
+
     pi.registerProvider(COPILOT_PROVIDER_ID, {
       baseUrl: COPILOT_BASE_URL,
       apiKey: bearer,
@@ -345,7 +402,6 @@ export class ProviderRegistrar {
     this.catalog = catalog;
     return { registered: true, descriptor, seededSession, seededSessionId: sessionId, bearer };
   }
-
   /** Build the intent router bound to the registered anchor endpoint. */
   routerFor(descriptor: EndpointDescriptor, options: IntentRouterOptions = {}): IntentRouter {
     return new IntentRouter(this.client, this.logger, descriptor, options, this.catalog);

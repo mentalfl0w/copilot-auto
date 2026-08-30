@@ -34,7 +34,8 @@
 import type { ExtensionAPI } from "./types.ts";
 import { CopilotAuto } from "./copilot-auto.ts";
 
-// Extension host expects a default export: (pi) => void, registering hooks.
-export default function copilotAuto(pi: ExtensionAPI): void {
-  new CopilotAuto(pi).register();
+// Extension host expects a default factory; await load-phase discovery so
+// startup model resolution can see the current OMP Auto pool aliases.
+export default async function copilotAuto(pi: ExtensionAPI): Promise<void> {
+  await new CopilotAuto(pi).registerWithDiscovery();
 }

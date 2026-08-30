@@ -8,22 +8,47 @@
  *   - refresh SESSION_REFRESH_SKEW_MS before server expiry,
  *   - single-flight dedup of concurrent ensureSession() calls,
  *   - stale-token tolerance when a refresh fails,
- *   - compaction invalidation via needsReEval.
+ *   - compaction invalidation via needsReEval,
+ *   - generation-based route staleness detection,
+ *   - scoped/global clear for shutdown and credential-disable.
  */
 
-import type { AutoSession, ConvState, LoggerLike } from "./types.ts";
+import type { AutoSession, ConvState, LoggerLike, ReasoningBucket } from "./types.ts";
+import { DEFAULT_SESSION_OPEN_TIMEOUT_MS } from "./capi-client.ts";
 import type { CapiClient } from "./capi-client.ts";
 
 export const DEFAULT_REFRESH_SKEW_MS = 60_000;
 
+interface ConvStateStoreOptions {
+  refreshSkewMs?: number;
+  sessionOpenTimeoutMs?: number;
+}
+
+interface EnsureSessionOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+function timeoutValue(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) ? Math.max(0, value) : fallback;
+}
+
 export class ConvStateStore {
   private readonly conversations = new Map<string, ConvState>();
+  private readonly refreshSkewMs: number;
+  private readonly sessionOpenTimeoutMs: number;
 
   constructor(
     private readonly client: CapiClient,
     private readonly logger: LoggerLike,
-    private readonly refreshSkewMs: number = DEFAULT_REFRESH_SKEW_MS,
-  ) {}
+    options: ConvStateStoreOptions = {},
+  ) {
+    this.refreshSkewMs = timeoutValue(options.refreshSkewMs, DEFAULT_REFRESH_SKEW_MS);
+    this.sessionOpenTimeoutMs = timeoutValue(
+      options.sessionOpenTimeoutMs,
+      DEFAULT_SESSION_OPEN_TIMEOUT_MS,
+    );
+  }
 
   /** Get or create the state for one conversation × auto model. The
    *  composite string key makes the map dynamic (runtime insert per turn). */
@@ -37,10 +62,6 @@ export class ConvStateStore {
     return conv;
   }
 
-  /** Iterate all live conversation states (input capture, token lookup). */
-  allConversations(): IterableIterator<ConvState> {
-    return this.conversations.values();
-  }
 
   /**
    * Return a live AutoSession for this conversation, opening or refreshing
@@ -53,15 +74,14 @@ export class ConvStateStore {
     baseURL: string,
     bearer: string | undefined,
     seeded?: AutoSession,
+    options: EnsureSessionOptions = {},
   ): Promise<AutoSession | undefined> {
     const conv = this.get(sessionId, autoModelID);
+    const routeGeneration = this.getRouteGeneration(conv);
 
     // Seed the cache with the catalog-level probe result (DESIGN §9.4)
     // before any session-open inflight starts: the very first turn serves
-    // the probe session instead of waiting on its own open. Assigning
-    // synchronously here also makes seeding work when a turn races an
-    // existing inflight; once a session exists this is a no-op, and the
-    // freshness/refresh logic below applies to the seeded value too.
+    // the probe session instead of waiting on its own open.
     if (!conv.session && seeded) {
       conv.session = seeded;
       this.logger.log(
@@ -76,7 +96,16 @@ export class ConvStateStore {
     }
     if (!bearer) return conv.session;
     if (!conv.sessionInflight) {
-      conv.sessionInflight = this.client.fetchAutoSession(baseURL, bearer).then((session) => {
+      let inflight!: Promise<AutoSession | undefined>;
+      inflight = this.client.fetchAutoSession(
+        baseURL,
+        bearer,
+        options.timeoutMs ?? this.sessionOpenTimeoutMs,
+        options.signal,
+      ).then((session) => {
+        if (!this.isRouteCurrent(sessionId, autoModelID, conv, routeGeneration)) {
+          return undefined;
+        }
         if (session) {
           this.logger.log(
             `session opened: pool=${session.availableModels.length} models, ` +
@@ -86,18 +115,26 @@ export class ConvStateStore {
         }
         return conv.session;
       }).finally(() => {
-        conv.sessionInflight = undefined;
+        if (conv.sessionInflight === inflight) conv.sessionInflight = undefined;
       });
+      conv.sessionInflight = inflight;
     }
     return await conv.sessionInflight;
   }
 
-  /** Invalidate sticky routing memory (compaction). */
+  /** Invalidate sticky routing memory (compaction). Clears session
+   *  cache/inflight and increments generation so in-flight route
+   *  results from before compaction are rejected. */
   markNeedsReEval(sessionId?: string): void {
     const target = sessionId
       ? [...this.conversations.entries()].filter(([k]) => k.startsWith(`${sessionId}::`))
       : [...this.conversations.entries()];
-    for (const [, conv] of target) conv.needsReEval = true;
+    for (const [, conv] of target) {
+      conv.needsReEval = true;
+      conv.sessionInflight = undefined;
+      conv.routedReasoningBucket = undefined;
+      conv.generation = (conv.generation ?? 0) + 1;
+    }
     if (target.length) this.logger.log(`route invalidated by compaction (${target.length} conversation states)`);
   }
 
@@ -108,9 +145,11 @@ export class ConvStateStore {
     label: ConvState["routedLabel"],
     omitSessionToken: boolean,
     confidence?: number,
+    reasoningBucket?: ReasoningBucket,
   ): void {
     conv.routedModelID = decided;
     conv.routedLabel = label;
+    conv.routedReasoningBucket = reasoningBucket;
     conv.routedConfidence = confidence;
     conv.omitSessionToken = omitSessionToken;
     conv.previousModel = decided;
@@ -118,8 +157,63 @@ export class ConvStateStore {
     conv.turn += 1;
   }
 
-  /** True when apiId belongs to the anchor family's session pool. */
-  inPool(conv: ConvState, apiId: string): boolean {
-    return conv.session?.availableModels.includes(apiId) ?? false;
+
+
+  // ── lifecycle-safe route API ────────────────────────────────────────
+
+  /**
+   * Return the generation counter for a conversation before an async
+   * route operation begins. Capture this once, pass to isRouteCurrent()
+   * when the result arrives.
+   */
+  getRouteGeneration(conv: ConvState): number {
+    return conv.generation ?? 0;
+  }
+
+  /**
+   * Verify that a route result is still current: the conversation must
+   * still live in the store AND its generation must match the captured
+   * value. Returns false when compaction/shutdown invalidated the route.
+   */
+  isRouteCurrent(
+    sessionId: string,
+    modelId: string,
+    conv: ConvState,
+    generation: number,
+  ): boolean {
+    const k = `${sessionId}::${modelId}`;
+    return this.conversations.get(k) === conv && (conv.generation ?? 0) === generation;
+  }
+
+  /**
+   * Invalidate and remove conversation state.
+   *
+   * Scoped (sessionId provided): removes all model entries for that
+   * session from the map, clearing the session state and in-flight promises.
+   *
+   * Global (no sessionId): removes every conversation. Used on full
+   * shutdown or credential-disable.
+   */
+  clear(sessionId?: string): void {
+    const target = sessionId
+      ? [...this.conversations.entries()].filter(([key]) => key.startsWith(`${sessionId}::`))
+      : [...this.conversations.entries()];
+    for (const [key, conv] of target) {
+      conv.generation = (conv.generation ?? 0) + 1;
+      conv.session = undefined;
+      conv.sessionInflight = undefined;
+      conv.lastPrompt = undefined;
+      conv.hasImage = undefined;
+      conv.referenceCount = undefined;
+      conv.routedModelID = undefined;
+      conv.routedLabel = undefined;
+      conv.routedReasoningBucket = undefined;
+      conv.routedConfidence = undefined;
+      conv.needsReEval = undefined;
+      conv.omitSessionToken = undefined;
+      conv.previousModel = undefined;
+      conv.turn = 0;
+      this.conversations.delete(key);
+    }
   }
 }

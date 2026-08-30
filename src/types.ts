@@ -17,6 +17,9 @@ export interface ExtensionAPI {
    *  truthy `pi` self-reference on the ExtensionAPI; Pi does not.
    *  Truthy → OMP, falsy/absent → Pi (see runtime-compat.ts). */
   pi?: unknown;
+  /** Optional host-native streaming/lazy-stream bridges. */
+  streamSimple?: (model: unknown, context: unknown, options?: unknown) => unknown;
+  lazyStream?: (model: unknown, setup: () => Promise<unknown>) => unknown;
   on(event: string, handler: (event: unknown, ctx: ExtensionCtx) => unknown): void;
   registerCommand(name: string, def: { description: string; handler: (args: unknown, ctx: ExtensionCtx) => void | Promise<void> }): void;
   /** Structured sink into the host's own log file (best-effort). */
@@ -32,7 +35,7 @@ export interface ExtensionAPI {
 export interface ProviderModelEntry {
   id: string;
   name: string;
-  api: CopilotApi;
+  api: string;
   baseUrl?: string;
   contextWindow?: number;
   maxTokens?: number;
@@ -74,9 +77,17 @@ export interface EndpointDescriptor {
 export interface CopilotCatalogModel {
   provider?: string;
   id: string;
+  name?: string;
   api?: string;
   baseUrl?: string;
+  reasoning?: boolean;
+  input?: string[];
+  cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  contextWindow?: number;
+  maxTokens?: number;
+  headers?: Record<string, string>;
   compat?: Record<string, unknown>;
+  [key: string]: unknown;
 }
 
 export interface ProviderRegistration {
@@ -84,6 +95,10 @@ export interface ProviderRegistration {
   apiKey?: string;
   api?: string;
   headers?: Record<string, string>;
+  /** Optional request-local native stream handler for OMP adapters. */
+  streamSimple?: (model: unknown, context: unknown, options?: unknown) => unknown;
+  /** Optional dynamic model discovery callback supplied by OMP adapters. */
+  fetchDynamicModels?: (apiKey?: string) => readonly ProviderModelEntry[] | Promise<readonly ProviderModelEntry[]>;
   /** OAuth-provider marker — OMP ONLY (see runtime-compat.loadPhaseOAuth).
    *  OMP's runtime registerProvider validates non-empty model lists as
    *  requiring `apiKey` or `oauth`; the marker makes the credential-less
@@ -107,6 +122,8 @@ export interface ExtensionCtx {
   sessionManager?: { getSessionId?: () => string | undefined };
   modelRegistry?: {
     getApiKeyForProvider(providerId: string, sessionId?: string, opts?: unknown): Promise<string | undefined>;
+    /** Pi-native provider lookup, when the host exposes complete providers. */
+    getProvider?(providerId: string): unknown;
     /** Pi fallback: resolves the provider's current auth (stored OAuth /
      *  api key) when getApiKeyForProvider is absent or fails. Never
      *  log the returned credential. */
@@ -119,6 +136,8 @@ export interface ExtensionCtx {
      *  Present on the live ModelRegistry; used to ensure ctx.models.list()
      *  reflects the account's current catalog before anchoring. */
     refreshInBackground?(mode?: string): void;
+    /** Refresh runtime-registered dynamic providers after registration. */
+    refreshRuntimeProviders?(mode?: string): Promise<void>;
     /** Resolve when an in-flight background refresh settles. */
     awaitBackgroundRefresh?(): Promise<void>;
   };
@@ -140,22 +159,40 @@ export interface ExtensionCtx {
 
 // ── Copilot CAPI value objects ───────────────────────────────────────
 
+/** Structural subset of a live host-registry Model object as returned by
+ *  ctx.models.list() (catalog + registered models). Only the fields the
+ *  endpoint anchor reads are declared. */
+export interface SelectedModelMetadata {
+  id: string;
+  /** The server may add model/catalog metadata as Auto evolves. */
+  [key: string]: unknown;
+}
+
 /** Parsed POST /models/session response — one per conversation × auto model. */
 export interface AutoSession {
   selectedModelID: string;
+  /** Embedded model metadata when the server returned an object selection. */
+  selectedModel?: SelectedModelMetadata;
   sessionToken: string;
+  /** Stable request correlation id shared by session and intent calls. */
+  interactionId?: string;
   availableModels: string[];
   discountedCosts: Record<string, number>;
+  hydraScores?: Record<string, number>;
   expiresAtMs: number;
 }
 
-/** Shape of POST /models/session/intent (intent router) response. */
+/** Reasoning effort returned by the session/intent router. */
+export type ReasoningBucket = "low" | "medium" | "high";
+
+/** Shape of POST /models/session/intent response consumed by routing. */
 export interface RouterDecision {
   predicted_label?: "needs_reasoning" | "no_reasoning";
+  reasoning_bucket?: ReasoningBucket;
   confidence?: number;
   candidate_models?: string[];
-  scores?: { needs_reasoning: number; no_reasoning: number };
-  sticky_override?: boolean;
+  chosen_model?: string;
+  selected_model?: string;
 }
 
 /** Routing label produced by the intent router. */
@@ -167,15 +204,20 @@ export interface ConvState {
   /** Single-flight promise so same-turn callers share one open/refresh. */
   sessionInflight?: Promise<AutoSession | undefined>;
   lastPrompt?: string;
+  hasImage?: boolean;
   referenceCount?: number;
   routedModelID?: string;
   routedLabel?: RouteLabel;
+  routedReasoningBucket?: ReasoningBucket;
   /** Intent-router confidence of the committed route (DESIGN §9.5 logs). */
   routedConfidence?: number;
   needsReEval?: boolean;
   /** True when the decided model is outside the session pool: send WITHOUT token. */
   omitSessionToken?: boolean;
   previousModel?: string;
+  /** Generation counter: incremented on clear/markNeedsReEval so route
+   *  callers can detect stale results after compaction or shutdown. */
+  generation?: number;
   turn: number;
 }
 
@@ -184,13 +226,12 @@ export interface ConvState {
 /** The provider-request body as seen by before_provider_request. */
 export interface WirePayload {
   model?: string;
-  /** Anthropic thinking budget — boost-only, written on needs_reasoning turns. */
+  /** Anthropic thinking budget — boost-only, written on reasoning turns. */
   thinking?: { type: "enabled"; budget_tokens: number };
-  /** OpenAI chat-completions reasoning effort — boost-only, written on
-   *  needs_reasoning turns for openai-completions anchors. */
-  reasoning_effort?: "high";
-  /** OpenAI responses reasoning block — boost-only for openai-responses
-   *  anchors; extra fields (include, enabled, …) are preserved. */
+  /** OpenAI chat-completions reasoning effort — written on reasoning turns. */
+  reasoning_effort?: ReasoningBucket;
+  /** OpenAI responses reasoning block — written on reasoning turns; extra
+   *  fields (include, enabled, …) are preserved. */
   reasoning?: { effort?: string; summary?: string; [k: string]: unknown };
   [k: string]: unknown;
 }
@@ -202,6 +243,8 @@ export interface CopilotAutoOptions {
   apiVersion?: string;
   /** Refresh a session token this long before server expiry (ms). */
   refreshSkewMs?: number;
+  /** /models/session hard abort (ms); defaults to 15s. */
+  sessionOpenTimeoutMs?: number;
   /** Intent-router hard abort (ms). VS Code mirrors 1s. */
   intentTimeoutMs?: number;
   /** Catalog-level probe timeout used to pick the anchor endpoint (ms). */

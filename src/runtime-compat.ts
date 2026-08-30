@@ -27,16 +27,16 @@
  *     getProviderAuth()?.auth?.apiKey is the fallback for hosts without
  *     getApiKeyForProvider. Credentials are never logged.
  *
- * No `@oh-my-pi` / `@earendil-works` import: the host API is consumed
- * through structural interfaces (types.ts), so the bundle loads in both
- * runtimes with zero host-specific imports and works under Node.js/jiti
- * (Pi) exactly as under the Bun-based OMP binary.
+ * The shared core has no STATIC host imports: platform-specific modules are
+ * loaded only in the selected literal branch when the host-neutral entry is
+ * loaded directly. Host-specific entries attach their helpers before calling
+ * the shared core, so normal package loading stays host-local.
  */
 
 import type { CopilotCatalogModel, ExtensionCtx } from "./types.ts";
 
 /** The two hosts the bundle runs under. */
-export type RuntimeKind = "omp" | "pi";
+type RuntimeKind = "omp" | "pi";
 
 /**
  * Runtime discriminator (omp-wechat convention): OMP injects a truthy
@@ -45,6 +45,69 @@ export type RuntimeKind = "omp" | "pi";
  */
 export function runtimeKind(api: { pi?: unknown }): RuntimeKind {
   return api.pi ? "omp" : "pi";
+}
+
+/** Minimal lazy stream factory required by async provider routing. */
+type LazyStreamFactory = (
+  model: unknown,
+  setup: () => Promise<unknown>,
+) => unknown;
+
+/**
+ * Resolve the host's lazy stream helper. Host-specific entries attach the
+ * function directly; the literal dynamic-import fallback keeps the
+ * host-neutral entry usable when loaded directly.
+ */
+export async function resolveLazyStreamFactory(
+  api: { lazyStream?: unknown },
+  kind: RuntimeKind,
+): Promise<LazyStreamFactory | undefined> {
+  if (typeof api.lazyStream === "function") {
+    return api.lazyStream as LazyStreamFactory;
+  }
+
+  // The host loader rewrites these literal platform branches. Keep them
+  // literal; a variable specifier bypasses OMP's bundled-module shim.
+  try {
+    const module = kind === "omp"
+      ? await import("@oh-my-pi/pi-ai")
+      : await import("@earendil-works/pi-ai");
+    const lazyStream = (module as { lazyStream?: unknown }).lazyStream;
+    return typeof lazyStream === "function" ? lazyStream as LazyStreamFactory : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Native stream delegate exported by the host AI package. */
+type NativeStreamSimpleFactory = (
+  model: unknown,
+  context: unknown,
+  options?: unknown,
+) => unknown;
+
+
+/**
+ * Resolve the OMP native stream dispatcher. The Pi backend delegates
+ * directly to its base provider, so loading Pi's `streamSimple` here would
+ * be an unreachable compatibility path.
+ */
+export async function resolveNativeStreamSimpleFactory(
+  api: { streamSimple?: unknown },
+): Promise<NativeStreamSimpleFactory | undefined> {
+  if (typeof api.streamSimple === "function") {
+    return api.streamSimple as NativeStreamSimpleFactory;
+  }
+
+  try {
+    const module = await import("@oh-my-pi/pi-ai");
+    const streamSimple = (module as { streamSimple?: unknown }).streamSimple;
+    return typeof streamSimple === "function"
+      ? streamSimple as NativeStreamSimpleFactory
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -98,7 +161,7 @@ function isCatalogModel(value: unknown): value is CopilotCatalogModel {
 
 /** Structural subset of the credential-resolution surface (types.ts
  *  modelRegistry). Keep the adapter duck-typed — never `any`. */
-export interface CredentialRegistry {
+interface CredentialRegistry {
   getApiKeyForProvider?(providerId: string, sessionId?: string, opts?: unknown): Promise<string | undefined>;
   getProviderAuth?(providerId: string): Promise<{ auth?: { apiKey?: string } } | undefined>;
 }

@@ -1,28 +1,51 @@
 /**
  * copilot-auto — Copilot CAPI client.
  *
- * Drives the two server endpoints behind Copilot "auto":
- *   POST {base}/models/session        → session pool + Copilot-Session-Token
- *   POST {base}/models/session/intent → per-prompt routing classification
- *
+ * Drives the Copilot Auto session/intent control endpoints:
+ *   POST {base}/models/session        → Auto pool + session token
+ *   POST {base}/models/session/intent → per-prompt model classification
  * Header construction, endpoint contract and timeouts mirror the
  * reference plugin (DESIGN.md §2.2).  The Bearer credential is injected:
  * this class never reads host auth state itself.
  */
 
-import type { AutoSession, LoggerLike, RouterDecision } from "./types.ts";
+import type {
+  AutoSession,
+  LoggerLike,
+  ReasoningBucket,
+  RouterDecision,
+  SelectedModelMetadata,
+} from "./types.ts";
 import type { CopilotApi, EndpointDescriptor } from "./types.ts";
 
-/** Catalog-identical wire headers (omp packages/catalog COPILOT_API_HEADERS). */
-export const COPILOT_USER_AGENT = "opencode/1.3.15";
+/** Copilot Chat request profile mirrored from the upstream Pi adapter. */
 export const DEFAULT_API_VERSION = "2026-06-01";
+export const COPILOT_USER_AGENT = "GitHubCopilotChat/0.35.0";
+export const COPILOT_EDITOR_VERSION = "vscode/1.107.0";
+export const COPILOT_EDITOR_PLUGIN_VERSION = "copilot-chat/0.35.0";
+export const COPILOT_INTEGRATION_ID = "vscode-chat";
+export const COPILOT_OPENAI_INTENT = "conversation-edits";
+export const COPILOT_HEADERS: Readonly<Record<string, string>> = {
+  Accept: "application/json",
+  "Content-Type": "application/json",
+  "User-Agent": COPILOT_USER_AGENT,
+  "Editor-Version": COPILOT_EDITOR_VERSION,
+  "Editor-Plugin-Version": COPILOT_EDITOR_PLUGIN_VERSION,
+  "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
+  "X-GitHub-Api-Version": DEFAULT_API_VERSION,
+  "Openai-Intent": COPILOT_OPENAI_INTENT,
+};
+/** Timeout for opening or refreshing a session. */
+export const DEFAULT_SESSION_OPEN_TIMEOUT_MS = 15_000;
+/** Timeout for the advisory intent request. */
+const DEFAULT_INTENT_TIMEOUT_MS = 1_000;
 /** Generic Copilot chat/control host. */
 export const COPILOT_BASE_URL = "https://api.githubcopilot.com";
 /** Account-specific Copilot host the current GPT/MAI/Gemini catalog
  *  entries are served from (live catalog: openai-responses models like
  *  mai-code-1.1-flash and gpt-5.4 use it; the CAPI control endpoints
  *  stay on the generic host). */
-export const COPILOT_INDIVIDUAL_BASE_URL = "https://api.individual.githubcopilot.com";
+const COPILOT_INDIVIDUAL_BASE_URL = "https://api.individual.githubcopilot.com";
 
 /**
  * Load-phase / probe-failure default anchor. openai-responses is the
@@ -36,8 +59,10 @@ export const DEFAULT_COPILOT_DESCRIPTOR: EndpointDescriptor = {
   baseUrl: COPILOT_INDIVIDUAL_BASE_URL,
 };
 
-export interface CapiClientOptions {
+interface CapiClientOptions {
   apiVersion?: string;
+  /** /models/session timeout when a call does not override it. */
+  sessionOpenTimeoutMs?: number;
 }
 
 /**
@@ -52,6 +77,85 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function parseSelectedModel(value: unknown): SelectedModelMetadata | undefined {
+  if (!isRecord(value) || typeof value.id !== "string" || value.id.trim().length === 0) return undefined;
+  return { ...value, id: value.id };
+}
+
+function parseNumberRecord(value: unknown): Record<string, number> | undefined {
+  if (!isRecord(value)) return undefined;
+  return Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, number] => isFiniteNumber(entry[1])),
+  );
+}
+
+function parseStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function parseString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function parseReasoningBucket(value: unknown): ReasoningBucket | undefined {
+  return value === "low" || value === "medium" || value === "high" ? value : undefined;
+}
+
+/** OMP stores GitHub Copilot OAuth as a JSON envelope; CAPI needs its token. */
+function bearerToken(value: string): string {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (isRecord(parsed)) {
+      const token = parseString(parsed.token);
+      if (token) return token;
+    }
+  } catch {}
+  return value;
+}
+
+function timeoutValue(value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  return isFiniteNumber(value) ? Math.max(0, value) : fallback;
+}
+
+interface AbortLease {
+  signal: AbortSignal;
+  dispose(): void;
+}
+
+/** Merge caller cancellation with a hard deadline without AbortSignal.any(). */
+function mergeAbortSignal(callerSignal: AbortSignal | undefined, timeoutMs: number): AbortLease {
+  const controller = new AbortController();
+  const timer: ReturnType<typeof setTimeout> = setTimeout(() => controller.abort(), timeoutMs);
+  const onCallerAbort = (): void => controller.abort();
+
+  if (callerSignal) {
+    if (callerSignal.aborted) {
+      controller.abort();
+    } else {
+      callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timer);
+      callerSignal?.removeEventListener("abort", onCallerAbort);
+    },
+  };
+}
+
+function errorKind(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error;
+}
+
+
 /** True when value is one of the three supported wire API families. */
 export function isCopilotApi(value: unknown): value is CopilotApi {
   return (
@@ -61,7 +165,7 @@ export function isCopilotApi(value: unknown): value is CopilotApi {
   );
 }
 /** True when an api id fingerprints as the Claude family (catalog identity policy). */
-export function isClaudeApiId(apiId: string): boolean {
+function isClaudeApiId(apiId: string): boolean {
   return /claude/i.test(apiId);
 }
 
@@ -73,7 +177,7 @@ export function isClaudeApiId(apiId: string): boolean {
  * token-stamped routing or anchoring until their endpoint is known. Never
  * classify an id into a family the catalog does not use for it.
  */
-export function classifyApiId(apiId: string): CopilotApi | undefined {
+function classifyApiId(apiId: string): CopilotApi | undefined {
   if (isClaudeApiId(apiId)) return "anthropic-messages";
   if (/gemini/i.test(apiId)) return "openai-completions";
   if (/(^|[-_])(gpt|codex|mai)/i.test(apiId)) return "openai-responses";
@@ -83,7 +187,7 @@ export function classifyApiId(apiId: string): CopilotApi | undefined {
 /** Default chat base URL for a family when no catalog metadata exists.
  *  The current Copilot GPT/MAI/Gemini catalog is served from the
  *  account-specific host; the anthropic family lives on the generic one. */
-export function defaultBaseUrlFor(api: CopilotApi): string {
+function defaultBaseUrlFor(api: CopilotApi): string {
   switch (api) {
     case "anthropic-messages":
       return COPILOT_BASE_URL;
@@ -120,56 +224,61 @@ export function endpointKey(descriptor: EndpointDescriptor): string {
 
 export class CapiClient {
   private readonly apiVersion: string;
-  /** Per-process identity headers (DESIGN §2.2) — generated ONCE per
-   *  CapiClient, not fresh per request like a naive per-call UUID. */
-  private readonly vsCodeSessionId: string;
-  private readonly vsCodeMachineId: string;
-  private readonly editorDeviceId: string;
+  private readonly sessionOpenTimeoutMs: number;
 
   constructor(
     private readonly logger: LoggerLike,
     options: CapiClientOptions = {},
   ) {
     this.apiVersion = options.apiVersion ?? DEFAULT_API_VERSION;
-    this.vsCodeSessionId = `${crypto.randomUUID()}${Date.now()}`;
-    this.vsCodeMachineId = crypto.randomUUID().replace(/-/g, "");
-    this.editorDeviceId = crypto.randomUUID();
+    this.sessionOpenTimeoutMs = timeoutValue(options.sessionOpenTimeoutMs, DEFAULT_SESSION_OPEN_TIMEOUT_MS);
   }
 
   /**
-   * Headers shared by both CAPI calls. VS Code's @vscode/copilot-api always
-   * stamps random per-process session/machine/device ids; Editor-Version /
-   * Editor-Plugin-Version / Copilot-Integration-Id are omitted (reference
-   * plugin keeps them commented out) — add Copilot-Integration-Id first if
-   * /models/session/intent starts answering 404.
+   * Headers shared by CAPI calls. Bearer/session credentials stay in the
+   * request only; this client never logs or stores them.
    */
-  private headers(bearer: string, sessionToken?: string): Record<string, string> {
+  private headers(
+    bearer: string,
+    sessionToken?: string,
+    interactionId?: string,
+  ): Record<string, string> {
     const h: Record<string, string> = {
-      Authorization: `Bearer ${bearer}`,
-      "Content-Type": "application/json",
+      ...COPILOT_HEADERS,
+      Authorization: `Bearer ${bearerToken(bearer)}`,
       "X-GitHub-Api-Version": this.apiVersion,
-      "User-Agent": COPILOT_USER_AGENT,
-      "VScode-SessionId": this.vsCodeSessionId,
-      "VScode-MachineId": this.vsCodeMachineId,
-      "Editor-Device-Id": this.editorDeviceId,
+      "X-Initiator": "user",
     };
     if (sessionToken) h["Copilot-Session-Token"] = sessionToken;
+    if (interactionId) h["X-Interaction-Id"] = interactionId;
     return h;
   }
 
-  /** POST {base}/models/session — open/refresh an auto session. */
-  async fetchAutoSession(baseURL: string, bearer: string, timeoutMs?: number): Promise<AutoSession | undefined> {
+  /**
+   * POST {base}/models/session — open/refresh an auto session.
+   * The optional timeout and caller signal are merged with the hard deadline.
+   */
+  async fetchAutoSession(
+    baseURL: string,
+    bearer: string,
+    timeoutMs?: number,
+    callerSignal?: AbortSignal,
+  ): Promise<AutoSession | undefined> {
+    const resolvedTimeoutMs = timeoutValue(timeoutMs, this.sessionOpenTimeoutMs);
+    const lease = mergeAbortSignal(callerSignal, resolvedTimeoutMs);
     const now = Date.now();
+    const interactionId = crypto.randomUUID();
     try {
+      if (callerSignal?.aborted) return undefined;
       const response = await fetch(`${baseURL}/models/session`, {
         method: "POST",
-        headers: this.headers(bearer),
+        headers: this.headers(bearer, undefined, interactionId),
         body: JSON.stringify({ auto_mode: { model_hints: ["auto"] } }),
-        signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined,
+        signal: lease.signal,
       });
       if (!response.ok) {
-        const body = await response.text().catch(() => "");
-        this.logger.log(`auto session fetch non-ok: ${response.status} ${body.slice(0, 300)}`);
+        await response.text().catch(() => "");
+        this.logger.log(`auto session fetch non-ok: ${response.status}`);
         return undefined;
       }
       const data: unknown = await response.json().catch(() => undefined);
@@ -180,25 +289,37 @@ export class CapiClient {
       const availableModels = Array.isArray(data.available_models)
         ? data.available_models.filter((m): m is string => typeof m === "string")
         : [];
+      const selectedModel = parseSelectedModel(data.selected_model);
       const selectedModelID =
-        typeof data.selected_model === "string" ? data.selected_model : availableModels[0];
+        parseString(data.selected_model) ??
+        selectedModel?.id ??
+        parseString(data.chosen_model) ??
+        availableModels[0];
       if (!selectedModelID) {
         this.logger.log("auto session fetch invalid payload (no selected_model and no available_models)");
         return undefined;
       }
-      const discountedCosts: Record<string, number> =
-        isRecord(data.discounted_costs)
-          ? Object.fromEntries(
-              Object.entries(data.discounted_costs).filter(
-                (entry): entry is [string, number] => typeof entry[1] === "number",
-              ),
-            )
-          : {};
-      const expiresAtMs = typeof data.expires_at === "number" ? data.expires_at * 1000 : now + 30 * 60_000;
-      return { selectedModelID, sessionToken: data.session_token, availableModels, discountedCosts, expiresAtMs };
+      const discountedCosts = parseNumberRecord(data.discounted_costs) ?? {};
+      const hydraScores = parseNumberRecord(data.hydra_scores);
+      const expiresAtMs = isFiniteNumber(data.expires_at)
+        ? data.expires_at * 1000
+        : now + 30 * 60_000;
+      const session: AutoSession = {
+        selectedModelID,
+        sessionToken: data.session_token,
+        interactionId,
+        availableModels,
+        discountedCosts,
+        expiresAtMs,
+      };
+      if (selectedModel) session.selectedModel = selectedModel;
+      if (hydraScores) session.hydraScores = hydraScores;
+      return session;
     } catch (error) {
-      this.logger.log(`auto session fetch failed: ${String(error)}`);
+      this.logger.log(`auto session fetch failed (${errorKind(error)})`);
       return undefined;
+    } finally {
+      lease.dispose();
     }
   }
 
@@ -213,50 +334,49 @@ export class CapiClient {
     prompt: string,
     availableModels: string[],
     context: IntentContext,
-    intentTimeoutMs: number,
+    intentTimeoutMs: number = DEFAULT_INTENT_TIMEOUT_MS,
+    interactionId?: string,
   ): Promise<RouterDecision | undefined> {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), intentTimeoutMs);
+    const lease = mergeAbortSignal(undefined, timeoutValue(intentTimeoutMs, DEFAULT_INTENT_TIMEOUT_MS));
+    const requestInteractionId = interactionId ?? crypto.randomUUID();
     try {
       const response = await fetch(`${baseURL}/models/session/intent`, {
         method: "POST",
-        headers: this.headers(bearer, sessionToken),
+        headers: this.headers(bearer, sessionToken, requestInteractionId),
         body: JSON.stringify({ prompt, available_models: availableModels, ...context }),
-        signal: ac.signal,
+        signal: lease.signal,
       });
       if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        this.logger.log(`intent fetch non-ok: ${response.status} ${text.slice(0, 300)}`);
+        await response.text().catch(() => "");
+        this.logger.log(`intent fetch non-ok: ${response.status}`);
         return undefined;
       }
-      // The intent response is advisory; parse it defensively like
-      // fetchAutoSession so a malformed body degrades to undefined
-      // (no routing happens) instead of throwing.
+      // The intent response is advisory; parse the two observed
+      // session/intent dialects: upstream uses chosen_model/reasoning_bucket,
+      // while the alternate client uses selected_model/predicted_label.
       const data: unknown = await response.json().catch(() => undefined);
       if (!isRecord(data)) return undefined;
+      const candidateModels = parseStringArray(data.candidate_models);
       const decision: RouterDecision = {
         predicted_label:
           data.predicted_label === "needs_reasoning" || data.predicted_label === "no_reasoning"
             ? data.predicted_label
             : undefined,
-        confidence: typeof data.confidence === "number" ? data.confidence : undefined,
-        candidate_models: Array.isArray(data.candidate_models)
-          ? data.candidate_models.filter((m): m is string => typeof m === "string")
-          : undefined,
-        sticky_override: typeof data.sticky_override === "boolean" ? data.sticky_override : undefined,
+        confidence: isFiniteNumber(data.confidence) ? data.confidence : undefined,
+        candidate_models: candidateModels,
       };
-      if (isRecord(data.scores)) {
-        decision.scores = {
-          needs_reasoning: typeof data.scores.needs_reasoning === "number" ? data.scores.needs_reasoning : 0,
-          no_reasoning: typeof data.scores.no_reasoning === "number" ? data.scores.no_reasoning : 0,
-        };
-      }
+      const reasoningBucket = parseReasoningBucket(data.reasoning_bucket);
+      if (reasoningBucket) decision.reasoning_bucket = reasoningBucket;
+      const chosenModel = parseString(data.chosen_model);
+      if (chosenModel) decision.chosen_model = chosenModel;
+      const selectedModel = parseString(data.selected_model);
+      if (selectedModel) decision.selected_model = selectedModel;
       return decision;
     } catch (error) {
-      this.logger.log(`intent fetch failed: ${String(error)}`);
+      this.logger.log(`intent fetch failed (${errorKind(error)})`);
       return undefined;
     } finally {
-      clearTimeout(timer);
+      lease.dispose();
     }
   }
 }
@@ -268,4 +388,5 @@ export interface IntentContext {
   previous_model?: string;
   reference_count?: number;
   prompt_char_count?: number;
+  has_image?: boolean;
 }
