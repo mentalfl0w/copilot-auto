@@ -1,4 +1,4 @@
-import { AssistantMessageEventStream, streamSimple } from "@oh-my-pi/pi-ai";
+import { createAssistantMessageEventStream, streamSimple, type AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI } from "./types.ts";
 import copilotAuto from "./index.ts";
 
@@ -7,7 +7,7 @@ import copilotAuto from "./index.ts";
  * helper, so keep the small forwarding adapter at the host-specific edge.
  */
 function lazyStream(_model: unknown, setup: () => Promise<unknown>): AssistantMessageEventStream {
-  const outer = new AssistantMessageEventStream();
+  const outer = createAssistantMessageEventStream();
   void setup()
     .then(async (source) => {
       if (!source || typeof (source as AsyncIterable<unknown>)[Symbol.asyncIterator] !== "function") {
