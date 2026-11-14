@@ -1,7 +1,7 @@
 {
   "name": "copilot-auto",
   "description": "GitHub Copilot auto-session routing for oh-my-pi (OMP) and Pi: injects github-copilot/auto, uses session/intent routing, and stamps Copilot-Session-Token through native request-local transports.",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "type": "module",
   "main": "dist/index.js",
   "files": [
